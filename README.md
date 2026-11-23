@@ -6,6 +6,8 @@ isolated fixtures, not verified on the sampler; compatibility is not guaranteed.
 Do not modify the card concurrently with another program or remove it during an
 operation.
 
+![SP-404SX Wave Converter screenshot](assets/screenshot.png)
+
 ```sh
 cargo run -- gui /path/to/card
 ```
