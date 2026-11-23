@@ -1,6 +1,9 @@
 # SP-404SX/A Wave Converter
 
 A Rust desktop sample manager for an SP-404SX/A-formatted card or card copy.
+This independent project is not affiliated with, endorsed by, or supported by
+Roland Corporation.
+
 **Back up the entire card before making changes.** Writing has been tested on
 isolated fixtures, not verified on the sampler; compatibility is not guaranteed.
 Do not modify the card concurrently with another program or remove it during an
