@@ -1,0 +1,7 @@
+/target/
+/sp404sx-card-backup.tar.gz
+/AGENTS.md
+.env
+.env.*
+*.pem
+*.key
