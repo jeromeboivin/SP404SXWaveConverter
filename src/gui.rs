@@ -1,5 +1,6 @@
+use crate::gui_editor::{Action as EditorAction, EditorView};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
-use sp404sx_wave_converter::Card;
+use sp404sx_wave_converter::{Card, PadTransfer};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -127,16 +128,40 @@ fn save_last_card(path: &Path, root: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PadMode {
+    Copy,
+    Exchange,
+}
+
+/// Hardware-style two-pad operation: pick the source, pick the destination, then confirm.
+#[derive(Clone, Copy)]
+struct PendingTransfer {
+    mode: PadMode,
+    source: Option<(char, u8)>,
+    destination: Option<(char, u8)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PadMark {
+    None,
+    Candidate(bool),
+    Source,
+    Destination,
+}
+
 struct App {
     root: String,
     card: Option<Card>,
     bank: char,
     selected: Option<u8>,
+    transfer: Option<PendingTransfer>,
     player: Option<Child>,
     playing: Option<(char, u8)>,
     message: String,
     skin: egui::TextureHandle,
     settings_path: Result<PathBuf, String>,
+    editor: Option<EditorView>,
 }
 
 impl App {
@@ -162,11 +187,13 @@ impl App {
             card: None,
             bank: 'A',
             selected: None,
+            transfer: None,
             player: None,
             playing: None,
             message,
             skin,
             settings_path,
+            editor: None,
         };
         if !app.root.is_empty() {
             app.open_card(explicit_root);
@@ -176,6 +203,7 @@ impl App {
 
     fn open_card(&mut self, remember: bool) {
         self.selected = None;
+        self.transfer = None;
         match Card::open(&self.root) {
             Ok(card) => {
                 self.card = Some(card);
@@ -257,23 +285,15 @@ impl App {
         let Some(file) = pad.file.as_ref() else {
             return;
         };
-        let Some(size) = pad.file_size else {
-            return;
+        let (start, duration) = match pad.preview_range() {
+            Ok(range) => range,
+            Err(error) => {
+                self.message = format!("Cannot preview sample: {error}");
+                return;
+            }
         };
-        let alignment = u32::from(pad.channels) * 2;
-        if !matches!(pad.channels, 1 | 2)
-            || pad.start < 512
-            || pad.end <= pad.start
-            || u64::from(pad.end) > size
-            || (pad.start - 512) % alignment != 0
-            || (pad.end - 512) % alignment != 0
-        {
-            self.message = "Invalid sample trim or channel settings.".into();
-            return;
-        }
-        let bytes_per_second = 44100.0 * f64::from(alignment);
-        let start = format!("{:.9}", f64::from(pad.start - 512) / bytes_per_second);
-        let duration = format!("{:.9}", f64::from(pad.end - pad.start) / bytes_per_second);
+        let start = format!("{start:.9}");
+        let duration = format!("{duration:.9}");
         match Command::new("ffplay")
             .args([
                 "-nodisp",
@@ -317,8 +337,7 @@ impl App {
             .pad(self.bank, number)
             .is_some_and(|pad| pad.file.is_some());
         let Some(path) = rfd::FileDialog::new()
-            .set_title("Select a WAV or AIFF sample")
-            .add_filter("WAV and AIFF audio", &["wav", "aif", "aiff"])
+            .set_title("Select an audio sample")
             .pick_file()
         else {
             return;
@@ -365,6 +384,108 @@ impl App {
         self.refresh_after_change();
     }
 
+    fn pad_has_sample(&self, bank: char, number: u8) -> bool {
+        self.card
+            .as_ref()
+            .and_then(|card| card.pad(bank, number))
+            .is_some_and(|pad| pad.file.is_some())
+    }
+
+    fn start_transfer(&mut self, mode: PadMode) {
+        if !self.stop() {
+            return;
+        }
+        self.selected = None;
+        self.transfer = Some(PendingTransfer {
+            mode,
+            source: None,
+            destination: None,
+        });
+        self.message = match mode {
+            PadMode::Copy => "CPY: press the pad holding the sample to copy.".into(),
+            PadMode::Exchange => "CHG: press the first pad to exchange.".into(),
+        };
+    }
+
+    fn cancel_transfer(&mut self) {
+        if self.transfer.take().is_some() {
+            self.message = "Cancelled.".into();
+        }
+    }
+
+    /// A pad was pressed while a copy/exchange is in progress.
+    fn pick_pad(&mut self, number: u8) {
+        let Some(mut transfer) = self.transfer else {
+            return;
+        };
+        let pad = (self.bank, number);
+        let has_sample = self.pad_has_sample(pad.0, pad.1);
+        let verb = match transfer.mode {
+            PadMode::Copy => "copy",
+            PadMode::Exchange => "exchange",
+        };
+        self.message = match transfer.source {
+            None if has_sample => {
+                transfer.source = Some(pad);
+                "Now press the destination pad (you can switch bank).".into()
+            }
+            None => "That pad is empty; press a pad that holds a sample.".into(),
+            Some(source) if source == pad => {
+                transfer.source = None;
+                transfer.destination = None;
+                "Source cleared; press the pad holding the sample.".into()
+            }
+            Some(_) if transfer.mode == PadMode::Copy && has_sample => {
+                transfer.destination = None;
+                "Copy needs an empty destination pad; use Exchange to swap two samples.".into()
+            }
+            Some(source) => {
+                transfer.destination = Some(pad);
+                format!(
+                    "Press REC to {verb} {}{} to {}{}.",
+                    source.0, source.1, pad.0, pad.1
+                )
+            }
+        };
+        self.transfer = Some(transfer);
+    }
+
+    /// REC pressed: run the confirmed operation.
+    fn finish_transfer(&mut self) {
+        let Some(PendingTransfer {
+            mode,
+            source: Some(source),
+            destination: Some(destination),
+        }) = self.transfer
+        else {
+            return;
+        };
+        if !self.stop() {
+            return;
+        }
+        self.transfer = None;
+        let Some(card) = self.card.as_mut() else {
+            self.message = "Open a formatted card first.".into();
+            return;
+        };
+        let destination_occupied = card
+            .pad(destination.0, destination.1)
+            .is_some_and(|pad| pad.file.is_some());
+        let (operation, label) = match mode {
+            PadMode::Copy => (PadTransfer::Copy, "Copy"),
+            PadMode::Exchange if destination_occupied => (PadTransfer::Swap, "Exchange"),
+            PadMode::Exchange => (PadTransfer::Move, "Exchange"),
+        };
+        self.message = match card.transfer_sample(source, destination, operation) {
+            Ok(()) => format!(
+                "{label} completed: {}{} to {}{}.",
+                source.0, source.1, destination.0, destination.1
+            ),
+            Err(error) => format!("{label} failed: {error}"),
+        };
+        self.refresh_after_change();
+    }
+
     fn refresh_after_change(&mut self) {
         match Card::open(&self.root) {
             Ok(card) => self.card = Some(card),
@@ -375,6 +496,22 @@ impl App {
             }
         }
     }
+
+    fn edit(&mut self, number: u8) {
+        if !self.stop() {
+            return;
+        }
+        let Some(card) = self.card.as_ref() else {
+            return;
+        };
+        let Some(pad) = card.pad(self.bank, number).cloned() else {
+            return;
+        };
+        match EditorView::open(card.root.clone(), pad) {
+            Ok(editor) => self.editor = Some(editor),
+            Err(error) => self.message = format!("Could not open editor: {error}"),
+        }
+    }
 }
 
 impl Drop for App {
@@ -383,7 +520,7 @@ impl Drop for App {
     }
 }
 
-fn paint_pad(ui: &egui::Ui, rect: Rect, number: u8, assigned: bool, selected: bool) {
+fn paint_pad(ui: &egui::Ui, rect: Rect, number: u8, assigned: bool, selected: bool, mark: PadMark) {
     let painter = ui.painter();
     if assigned {
         painter.rect_filled(rect, 1.0, Color32::from_rgba_unmultiplied(230, 30, 15, 120));
@@ -402,6 +539,29 @@ fn paint_pad(ui: &egui::Ui, rect: Rect, number: u8, assigned: bool, selected: bo
             StrokeKind::Outside,
         );
     }
+    let tag = match mark {
+        PadMark::Candidate(true) => Some((Color32::from_rgb(255, 215, 40), None)),
+        PadMark::Source => Some((Color32::from_rgb(255, 150, 30), Some("FROM"))),
+        PadMark::Destination => Some((Color32::from_rgb(70, 170, 255), Some("TO"))),
+        _ => None,
+    };
+    if let Some((color, label)) = tag {
+        painter.rect_stroke(
+            rect.expand(1.0),
+            1.0,
+            Stroke::new(2.5, color),
+            StrokeKind::Outside,
+        );
+        if let Some(label) = label {
+            painter.text(
+                rect.left_bottom() + Vec2::new(3.0, -2.0),
+                Align2::LEFT_BOTTOM,
+                label,
+                FontId::monospace(8.0),
+                color,
+            );
+        }
+    }
     let position = rect.center() + Vec2::new(0.0, -0.5);
     let font = FontId::monospace(19.0);
     for offset in [Vec2::ZERO, Vec2::new(0.6, 0.0), Vec2::new(0.0, 0.5)] {
@@ -417,6 +577,18 @@ fn paint_pad(ui: &egui::Ui, rect: Rect, number: u8, assigned: bool, selected: bo
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        let editor_viewport = egui::ViewportId::from_hash_of("sample_editor");
+        if self.transfer.is_some()
+            && ctx.input(|input| input.key_pressed(egui::Key::Escape))
+        {
+            self.cancel_transfer();
+        }
+        if self.editor.is_some() && ctx.input(|input| input.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd_to(editor_viewport, egui::ViewportCommand::Focus);
+        } else if self.editor.is_some() && ctx.input(|input| input.pointer.any_pressed()) {
+            ctx.send_viewport_cmd_to(editor_viewport, egui::ViewportCommand::Focus);
+        }
         if let Some(player) = self.player.as_mut() {
             match player.try_wait() {
                 Ok(Some(status)) => {
@@ -456,6 +628,9 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(11, 10)))
             .show(ctx, |ui| {
+                if self.editor.is_some() {
+                    ui.disable();
+                }
                 ui.add_space((header_bottom(skin) - ui.min_rect().top()).max(0.0) + 6.0);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -532,25 +707,112 @@ impl eframe::App for App {
                                         ui.id().with(("pad", number)),
                                         Sense::click(),
                                     );
+                                    let here = (self.bank, number);
+                                    let blink = (ui.input(|input| input.time) * 2.0) as u64 % 2 == 0;
+                                    let mark = match self.transfer {
+                                        Some(t) if t.source == Some(here) => PadMark::Source,
+                                        Some(t) if t.destination == Some(here) => {
+                                            PadMark::Destination
+                                        }
+                                        Some(t) if t.source.is_none() && assigned => {
+                                            PadMark::Candidate(blink)
+                                        }
+                                        Some(t)
+                                            if t.source.is_some()
+                                                && t.destination.is_none()
+                                                && (t.mode == PadMode::Exchange || !assigned) =>
+                                        {
+                                            PadMark::Candidate(blink)
+                                        }
+                                        _ => PadMark::None,
+                                    };
                                     paint_pad(
                                         ui,
                                         rect,
                                         number,
                                         assigned,
                                         self.selected == Some(number),
+                                        mark,
                                     );
                                     if response.clicked() {
-                                        self.selected = Some(number);
-                                        if assigned && response.double_clicked() {
-                                            self.play(number);
-                                        } else if assigned
-                                            && self.playing == Some((self.bank, number))
-                                        {
-                                            self.stop();
-                                        } else if !assigned {
-                                            self.import(number);
+                                        if self.transfer.is_some() {
+                                            self.pick_pad(number);
+                                        } else {
+                                            self.selected = Some(number);
+                                            if assigned && response.double_clicked() {
+                                                self.play(number);
+                                            } else if assigned
+                                                && self.playing == Some((self.bank, number))
+                                            {
+                                                self.stop();
+                                            } else if !assigned {
+                                                self.import(number);
+                                            }
                                         }
                                     }
+                                }
+                            }
+                        });
+                        ui.horizontal_wrapped(|ui| match self.transfer {
+                            None => {
+                                ui.label("Pads:");
+                                let enabled = self.card.is_some();
+                                if ui
+                                    .add_enabled(enabled, egui::Button::new("Copy"))
+                                    .on_hover_text(
+                                        "Copy a sample to an empty pad: press the source pad, \
+                                         then the destination pad, then REC",
+                                    )
+                                    .clicked()
+                                {
+                                    self.start_transfer(PadMode::Copy);
+                                }
+                                if ui
+                                    .add_enabled(enabled, egui::Button::new("Exchange"))
+                                    .on_hover_text(
+                                        "Swap two samples (or move one to an empty pad): press \
+                                         both pads, then REC",
+                                    )
+                                    .clicked()
+                                {
+                                    self.start_transfer(PadMode::Exchange);
+                                }
+                            }
+                            Some(transfer) => {
+                                ui.ctx()
+                                    .request_repaint_after(std::time::Duration::from_millis(250));
+                                ui.label(
+                                    egui::RichText::new(match transfer.mode {
+                                        PadMode::Copy => "CPY",
+                                        PadMode::Exchange => "CHG",
+                                    })
+                                    .monospace()
+                                    .strong()
+                                    .color(Color32::from_rgb(255, 150, 30)),
+                                );
+                                let ready = transfer.source.is_some() && transfer.destination.is_some();
+                                let lit = (ui.input(|input| input.time) * 2.0) as u64 % 2 == 0;
+                                let fill = if !ready {
+                                    Color32::from_gray(60)
+                                } else if lit {
+                                    Color32::from_rgb(235, 40, 30)
+                                } else {
+                                    Color32::from_rgb(120, 25, 20)
+                                };
+                                if ui
+                                    .add_enabled(
+                                        ready,
+                                        egui::Button::new(
+                                            egui::RichText::new("REC").strong().color(Color32::WHITE),
+                                        )
+                                        .fill(fill),
+                                    )
+                                    .clicked()
+                                {
+                                    self.finish_transfer();
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    self.cancel_transfer();
                                 }
                             }
                         });
@@ -558,7 +820,7 @@ impl eframe::App for App {
                         ui.horizontal(|ui| {
                             if ui
                                 .add_enabled(
-                                    self.card.is_some() && self.selected.is_some(),
+                                    self.card.is_some() && self.selected.is_some() && self.transfer.is_none(),
                                     egui::Button::new("Import").min_size(Vec2::new(75.0, 23.0)),
                                 )
                                 .clicked()
@@ -570,7 +832,8 @@ impl eframe::App for App {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    let can_delete = self.selected.is_some_and(|number| {
+                                    let can_delete = self.transfer.is_none()
+                                        && self.selected.is_some_and(|number| {
                                         self.card
                                             .as_ref()
                                             .and_then(|card| card.pad(self.bank, number))
@@ -586,6 +849,18 @@ impl eframe::App for App {
                                     {
                                         if let Some(number) = self.selected {
                                             self.delete(number);
+                                        }
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            can_delete,
+                                            egui::Button::new("Edit")
+                                                .min_size(Vec2::new(60.0, 23.0)),
+                                        )
+                                        .clicked()
+                                    {
+                                        if let Some(number) = self.selected {
+                                            self.edit(number);
                                         }
                                     }
                                 },
@@ -620,6 +895,73 @@ impl eframe::App for App {
                         }
                     });
             });
+        if let Some(mut editor) = self.editor.take() {
+            let title = format!("Sample editor — {}{}", editor.pad.bank, editor.pad.number);
+            let action = ctx.show_viewport_immediate(
+                editor_viewport,
+                egui::ViewportBuilder::default()
+                    .with_title(title)
+                    .with_inner_size([900.0, 650.0])
+                    .with_min_inner_size([500.0, 400.0]),
+                |ctx, class| editor.show(ctx, class),
+            );
+            match action {
+                EditorAction::None => self.editor = Some(editor),
+                EditorAction::Close => {
+                    if editor.sample.can_undo()
+                        && !Self::confirm("Discard edits?", "Discard the unsaved sample edits?")
+                    {
+                        self.editor = Some(editor);
+                    }
+                }
+                EditorAction::Save => {
+                    if !Self::confirm("Save pad?", "Save the edited sample and pad settings?") {
+                        self.editor = Some(editor);
+                        return;
+                    }
+                    let result = (|| -> Result<(), String> {
+                        let card = self.card.as_mut().ok_or("Card is not open")?;
+                        if card.root != editor.root {
+                            return Err("Card changed since the editor was opened".into());
+                        }
+                        let temp = if editor.sample.audio_changed() {
+                            let temp = tempfile::Builder::new()
+                                .suffix(".wav")
+                                .tempfile()
+                                .map_err(|e| format!("Could not create edited sample: {e}"))?;
+                            editor
+                                .sample
+                                .write_wav(temp.path())
+                                .map_err(|e| format!("Could not write edited sample: {e}"))?;
+                            Some(temp)
+                        } else {
+                            None
+                        };
+                        card.save_edited_pad(
+                            editor.pad.bank,
+                            editor.pad.number,
+                            temp.as_ref().map(|file| file.path()),
+                            editor.original.path(),
+                            editor.sample.play_range(),
+                            editor.sample.settings(),
+                        )
+                        .map_err(|e| e.to_string())
+                    })();
+                    match result {
+                        Ok(()) => {
+                            self.message = format!(
+                                "Saved edited sample to {}{}.",
+                                editor.pad.bank, editor.pad.number
+                            )
+                        }
+                        Err(error) => {
+                            editor.set_message(format!("Save failed: {error}"));
+                            self.editor = Some(editor);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -783,5 +1125,53 @@ mod tests {
 
         assert_eq!(app.root, "previous");
         assert!(app.message.contains("not valid UTF-8"));
+    }
+    fn app_with_samples(root: &Path, pads: &[&str]) -> App {
+        create_card(root);
+        for name in pads {
+            std::fs::write(root.join("ROLAND/SP-404SX/SMPL").join(name), b"x").unwrap();
+        }
+        test_app(
+            Some(root.to_str().unwrap().to_owned()),
+            &root.join("settings/last-card"),
+        )
+    }
+
+    #[test]
+    fn copy_flow_picks_source_then_empty_destination_then_waits_for_rec() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = app_with_samples(temp.path(), &["A0000001.WAV", "A0000003.WAV"]);
+        app.start_transfer(PadMode::Copy);
+
+        app.pick_pad(2); // empty pad cannot be a source
+        assert!(app.transfer.unwrap().source.is_none());
+        app.pick_pad(1);
+        assert_eq!(app.transfer.unwrap().source, Some(('A', 1)));
+        app.pick_pad(3); // occupied destination is refused for copy
+        assert!(app.transfer.unwrap().destination.is_none());
+        assert!(app.message.contains("empty destination"));
+        app.pick_pad(2);
+        assert_eq!(app.transfer.unwrap().destination, Some(('A', 2)));
+        assert!(app.message.contains("Press REC"));
+
+        app.pick_pad(1); // pressing the source again starts over
+        let transfer = app.transfer.unwrap();
+        assert!(transfer.source.is_none() && transfer.destination.is_none());
+
+        app.cancel_transfer();
+        assert!(app.transfer.is_none());
+    }
+
+    #[test]
+    fn exchange_flow_accepts_occupied_destination_and_different_bank() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = app_with_samples(temp.path(), &["A0000001.WAV", "B0000004.WAV"]);
+        app.start_transfer(PadMode::Exchange);
+        app.pick_pad(1);
+        app.bank = 'B';
+        app.pick_pad(4);
+        let transfer = app.transfer.unwrap();
+        assert_eq!(transfer.source, Some(('A', 1)));
+        assert_eq!(transfer.destination, Some(('B', 4)));
     }
 }

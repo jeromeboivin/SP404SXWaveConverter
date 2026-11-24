@@ -2,7 +2,11 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+pub mod ai;
+pub mod editor;
+mod transfer;
 mod write;
+pub use transfer::PadTransfer;
 
 pub const BANKS: usize = 10;
 pub const PADS_PER_BANK: usize = 12;
@@ -18,6 +22,51 @@ pub struct Pad {
     pub start: u32,
     pub end: u32,
     pub channels: u8,
+    pub settings: PadSettings,
+}
+
+/// Raw SX/A settings bytes. Unknown values are retained so they are not silently changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PadSettings {
+    pub level: u8,
+    pub loop_mode: u8,
+    pub gate: u8,
+    pub reverse: u8,
+}
+
+impl Default for PadSettings {
+    fn default() -> Self {
+        Self {
+            level: 127,
+            loop_mode: 0,
+            gate: 1,
+            reverse: 0,
+        }
+    }
+}
+
+impl PadSettings {
+    pub fn validate_changes(self, original: Self) -> io::Result<()> {
+        if self.level != original.level && self.level > 127 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid pad level",
+            ));
+        }
+        for (name, value, previous) in [
+            ("loop", self.loop_mode, original.loop_mode),
+            ("gate", self.gate, original.gate),
+            ("reverse", self.reverse, original.reverse),
+        ] {
+            if value != previous && value > 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid pad {name} setting"),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Pad {
@@ -78,6 +127,12 @@ impl Pad {
             start: read_u32(8),
             end: read_u32(12),
             channels: record[22],
+            settings: PadSettings {
+                level: record[16],
+                loop_mode: record[18],
+                gate: record[19],
+                reverse: record[20],
+            },
         })
     }
 }
@@ -144,10 +199,20 @@ mod tests {
         let mut record = [0; RECORD_SIZE];
         record[8..12].copy_from_slice(&512u32.to_be_bytes());
         record[12..16].copy_from_slice(&1024u32.to_be_bytes());
+        record[16..21].copy_from_slice(&[85, 9, 1, 0, 1]);
         record[22] = 2;
         let pad = Pad::from_record(24, &record, &[]).unwrap();
         assert_eq!((pad.bank, pad.number), ('C', 1));
         assert_eq!((pad.start, pad.end, pad.channels), (512, 1024, 2));
+        assert_eq!(
+            pad.settings,
+            PadSettings {
+                level: 85,
+                loop_mode: 1,
+                gate: 0,
+                reverse: 1
+            }
+        );
         assert!(pad.file.is_none());
     }
 

@@ -5,3 +5,5 @@
 .env.*
 *.pem
 *.key
+/models/*.onnx
+/models/*.sha256

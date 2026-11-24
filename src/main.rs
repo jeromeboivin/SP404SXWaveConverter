@@ -4,6 +4,8 @@ use std::process::{Command, ExitCode};
 
 #[cfg(feature = "gui")]
 mod gui;
+#[cfg(feature = "gui")]
+mod gui_editor;
 
 fn print_usage() {
     println!(

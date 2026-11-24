@@ -34,14 +34,61 @@ press Enter or refresh. The last successfully opened folder is remembered in
 `$XDG_CONFIG_HOME/sp404sx-wave-converter/last-card-folder` (or
 `~/.config/sp404sx-wave-converter/last-card-folder`) and reopened on startup.
 A card path supplied on the command line takes precedence. Choose a bank, then
-click an empty pad to import an
-uncompressed WAV or AIFF. To replace a sample, select its pad and use
+click an empty pad to import audio. To replace a sample, select its pad and use
 **Import**; **Delete** removes the selected sample. Both replacement and
 deletion require confirmation. Double-click an assigned pad to preview it;
 click the playing pad or **Stop** to stop.
 
-Import requires `ffmpeg` and `ffprobe` on `PATH`. Mono and stereo PCM input
-is converted to 44.1 kHz, 16-bit WAV. Imports reset the selected pad's
+To copy or move a sample, select its source pad, choose a destination bank and
+pad, and click **Copy** or **Move**. The destination must be empty. **Swap**
+exchanges two occupied pads. These operations retain the samples and their pad
+settings, and move and swap require confirmation. The controls may be below
+the fold in a small window.
+
+Select an assigned pad and click **Edit** to open its waveform in a separate
+window. Main-window controls are disabled until the editor is closed; the main
+window is not resized. On platforms without separate viewport support the editor
+appears inside the main window. Drag to select a region, or enter frame
+endpoints; use zoom and scroll for detail. Enable **Loop preview** before clicking
+**Preview selection** to repeat the exact selected frames with `ffplay`; click
+**Stop** to end playback. Preview uses a snapshot, so restart it after changing
+the selection, loop option, or audio. Playback may have a gap at the loop
+boundary and does not reproduce sampler effects.
+
+Trim to the selection, delete it, or normalize the entire sample. The pad panel
+shows channel and length and edits playback start/end in frames, gate, pad loop,
+forward/reverse, and level (0–127). **Use selection for start/end** sets the
+playback bounds without deleting audio. Pad loop is separate from loop preview;
+preview does not simulate these pad settings. Balance is unavailable in the
+known SX/A metadata. Unrecognized stored setting values are shown as unknown
+and preserved.
+
+Undo and redo apply to audio, playback bounds, and settings. **Save to pad**
+requires confirmation; a settings-only save leaves the original sample file
+and its name untouched and preserves unrelated metadata. Closing without saving
+discards edits after confirmation. Editing requires `ffmpeg` and `ffprobe` and
+supports 8- or 16-bit mono/stereo PCM at up to 44.1 kHz.
+
+**Detect beats** estimates a constant-tempo grid between 70 and 180 BPM for
+rhythmic audio of at least three seconds. It is not guaranteed accurate:
+half/double-tempo ambiguity, weak transients, and changing tempo can make the
+grid wrong. Check the waveform and adjust BPM and offset manually before
+using beat snapping. Snapping applies to waveform selections and is turned
+off after edits or undo/redo until the grid is checked again. Grid changes
+do not modify the pad's stored tempo.
+
+Editing keeps the decoded sample and audio-edit undo/redo copies in memory.
+Long samples or many edits can use substantial memory; loading, analysis, preview
+creation, and saving run synchronously and may temporarily freeze the window.
+
+Import requires `ffmpeg` and `ffprobe` on `PATH` and accepts audio formats
+supported by the installed FFmpeg. Audio is converted to WAV, preserving the
+sample rate up to 44.1 kHz and mono or stereo channels; higher rates are
+resampled to 44.1 kHz and multichannel audio is downmixed to stereo.
+8-bit PCM is kept at 8-bit; other audio is converted to 16-bit PCM.
+Lossy formats do not have a directly comparable PCM bit depth.
+Compatibility with the sampler at rates below 44.1 kHz or at 8-bit has not
+been verified. Imports reset the selected pad's
 settings and set its tempo to 120 BPM; automatic tempo detection is not
 implemented. Preview requires `ffplay` and applies the recorded start/end
 offsets, but does not reproduce other sampler effects or pad settings.
@@ -68,9 +115,10 @@ power loss, disconnection, or cleanup failure can leave the card inconsistent
 or a partially cleaned transaction. Stop using the card, preserve a copy of
 the entire card and transaction directory, and restore the independent backup
 if necessary. When present, `operation.txt`, `PAD_INFO.original`, and
-`original.sample` may help inspect an interrupted operation; do not assume
-all of them survived. Do not remove the transaction directory until the card
-has been checked or restored.
+`original.sample` may help inspect an interrupted operation. Pad transfers use
+`source.original`, `target.original`, and sample snapshots where applicable.
+Do not assume all of these files survived. Do not remove the transaction
+directory until the card has been checked or restored.
 
 SP-404 CompactFlash conversion is not implemented: its source format and
 destructive conversion behavior have not been verified. The card's tempo
