@@ -218,7 +218,7 @@ impl EditorView {
             let _ = tx.send(result);
         });
         self.ai_job = Some(rx);
-        self.message = "Analysing beats with beat-this (a few seconds)...".into();
+        self.message = "Analysing beats with beat-this (first use downloads ~83 MB of models to ~/.sp404sx-wave-converter)...".into();
     }
 
     fn poll_ai_job(&mut self, ctx: &egui::Context) {
@@ -995,7 +995,7 @@ impl EditorView {
                             }
                             if ui
                                 .add(Self::button("Detect (AI)", self.ai_job.is_none()))
-                                .on_hover_text("Neural beat tracking (beat-this); needs the models folder")
+                                .on_hover_text("Neural beat tracking (beat-this); downloads its models on first use")
                                 .clicked()
                             {
                                 self.start_ai_detect();
