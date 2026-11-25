@@ -49,11 +49,12 @@ Select an assigned pad and click **Edit** to open its waveform in a separate
 window. Main-window controls are disabled until the editor is closed; the main
 window is not resized. On platforms without separate viewport support the editor
 appears inside the main window. Drag to select a region, or enter frame
-endpoints; use zoom and scroll for detail. Enable **Loop preview** before clicking
-**Preview selection** to repeat the exact selected frames with `ffplay`; click
-**Stop** to end playback. Preview uses a snapshot, so restart it after changing
-the selection, loop option, or audio. Playback may have a gap at the loop
-boundary and does not reproduce sampler effects.
+endpoints; use zoom and scroll for detail, and double-click a waveform to select
+all of it. Drag the `[` and `]` tabs to refine the selection. **Preview** plays the
+selection, or everything when nothing is selected; enable **Loop preview** to repeat
+it. A looping preview follows the selection as you drag its edges, without
+restarting. Preview plays through your sound card and does not reproduce sampler
+effects.
 
 Trim to the selection, delete it, or normalize the entire sample. The pad panel
 shows channel and length and edits playback start/end in frames, gate, pad loop,

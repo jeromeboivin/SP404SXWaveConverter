@@ -6,6 +6,8 @@ use std::process::{Command, ExitCode};
 mod gui;
 #[cfg(feature = "gui")]
 mod gui_editor;
+#[cfg(feature = "gui")]
+mod player;
 
 fn print_usage() {
     println!(

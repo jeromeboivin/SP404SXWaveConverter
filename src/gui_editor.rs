@@ -1,12 +1,11 @@
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
+use crate::player::{Player, Source};
 use sp404sx_wave_converter::ai::{self, StemSet, STEM_NAMES};
 use sp404sx_wave_converter::editor::{BeatGrid, SampleEditor};
 use sp404sx_wave_converter::Pad;
 use std::ops::Range;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
-use std::time::Instant;
 
 pub enum Action {
     None,
@@ -20,6 +19,50 @@ struct StemState {
     set: StemSet,
     range: Range<usize>,
     include: [bool; 4],
+    /// Tracks the user deleted; they no longer show, play or export.
+    removed: [bool; 4],
+    /// Per-stem min/max buckets over the whole timeline (silent outside `range`).
+    peaks: Vec<Vec<(i16, i16)>>,
+}
+
+impl StemState {
+    /// Indices of the tracks that are still present, in display order.
+    fn live(&self) -> Vec<usize> {
+        (0..4).filter(|i| !self.removed[*i]).collect()
+    }
+}
+
+const SELECTION_TAB_WIDTH: f32 = 20.0;
+
+const STEM_COLORS: [Color32; 4] = [
+    Color32::from_rgb(240, 120, 150),
+    Color32::from_rgb(110, 200, 245),
+    Color32::from_rgb(130, 220, 140),
+    Color32::from_rgb(235, 200, 100),
+];
+
+fn stem_peaks(set: &StemSet, range: &Range<usize>, channels: usize, frames: usize) -> Vec<Vec<(i16, i16)>> {
+    let bucket_frames = frames.div_ceil(8192).max(1);
+    let buckets = frames.div_ceil(bucket_frames);
+    set.stems
+        .iter()
+        .map(|stem| {
+            (0..buckets)
+                .map(|b| {
+                    let from = (b * bucket_frames).max(range.start);
+                    let to = ((b + 1) * bucket_frames).min(range.end);
+                    if from >= to {
+                        return (0, 0);
+                    }
+                    let slice = &stem[(from - range.start) * channels..(to - range.start) * channels];
+                    (
+                        slice.iter().copied().min().unwrap_or(0),
+                        slice.iter().copied().max().unwrap_or(0),
+                    )
+                })
+                .collect()
+        })
+        .collect()
 }
 
 type StemJob = mpsc::Receiver<Result<(StemSet, Range<usize>), String>>;
@@ -36,12 +79,10 @@ pub struct EditorView {
     zoom: f32,
     view_start: usize,
     peaks: Vec<Vec<(i16, i16)>>,
-    player: Option<Child>,
-    preview: Option<tempfile::NamedTempFile>,
+    audio: Option<Player>,
     loop_preview: bool,
     bars_ruler: bool,
     pending_play: Option<Range<usize>>,
-    playhead: Option<(Instant, usize, usize, bool)>,
     ai_job: Option<mpsc::Receiver<Result<BeatGrid, String>>>,
     target_bpm: f64,
     stems: Option<StemState>,
@@ -78,12 +119,10 @@ impl EditorView {
             zoom: 1.0,
             view_start: 0,
             peaks: Vec::new(),
-            player: None,
-            preview: None,
+            audio: None,
             loop_preview: false,
             bars_ruler: false,
             pending_play: None,
-            playhead: None,
             ai_job: None,
             target_bpm: 120.0,
             stems: None,
@@ -116,67 +155,89 @@ impl EditorView {
         }
     }
 
+    fn is_playing(&self) -> bool {
+        self.audio.as_ref().is_some_and(|player| player.is_playing())
+    }
+
     fn stop(&mut self) -> Result<(), String> {
-        if let Some(mut child) = self.player.take() {
-            match child.try_wait() {
-                Err(e) => {
-                    self.player = Some(child);
-                    return Err(format!("Could not check preview: {e}"));
+        if let Some(player) = &self.audio {
+            player.stop();
+        }
+        Ok(())
+    }
+
+    /// Audio the preview plays: the sample itself, or the unmuted stems summed.
+    fn preview_source(&self) -> Result<Source, String> {
+        let channels = self.sample.channels;
+        let rate = self.sample.sample_rate;
+        match &self.stems {
+            Some(state) => {
+                let mix = state
+                    .set
+                    .mix(state.include)
+                    .ok_or("Every track is muted; click a track's box to unmute one")?;
+                Ok(Source {
+                    audio: std::sync::Arc::new(mix),
+                    channels,
+                    rate,
+                    origin: state.range.start,
+                })
+            }
+            None => Ok(Source {
+                audio: self.sample.samples_arc(),
+                channels,
+                rate,
+                origin: 0,
+            }),
+        }
+    }
+
+    /// Start (or restart) the preview of the selection, or of everything if nothing is selected.
+    fn preview(&mut self) -> Result<(), String> {
+        let range = self.preview_target();
+        let source = self.preview_source()?;
+        if self.audio.is_none() {
+            self.audio = Some(Player::new()?);
+        }
+        if let Some(player) = &self.audio {
+            player.start(source, range, self.loop_preview);
+        }
+        Ok(())
+    }
+
+    /// Keep a running preview in step with the editor, without restarting it: the loop bounds
+    /// follow the selection and the loop switch is applied live.
+    fn sync_live_preview(&mut self) {
+        let Some(player) = &self.audio else { return };
+        if !player.is_playing() {
+            return;
+        }
+        player.set_looping(self.loop_preview);
+        player.set_range(self.preview_target());
+    }
+
+    /// After muting, unmuting or deleting a track, swap the audio under the running preview.
+    fn refresh_preview_source(&mut self) {
+        if !self.is_playing() {
+            return;
+        }
+        match self.preview_source() {
+            Ok(source) => {
+                if let Some(player) = &self.audio {
+                    player.set_source(source);
                 }
-                Ok(status) => match status {
-                    None => {
-                        if let Err(e) = child.kill().and_then(|_| child.wait()) {
-                            self.player = Some(child);
-                            return Err(format!("Could not stop preview: {e}"));
-                        }
-                    }
-                    Some(status) if !status.success() => {
-                        return Err(format!("Preview failed: {status}"))
-                    }
-                    Some(_) => {}
-                },
+            }
+            Err(message) => {
+                let _ = self.stop();
+                self.message = message;
             }
         }
-        self.preview = None;
-        self.playhead = None;
-        Ok(())
-    }
-
-    fn preview(&mut self) -> Result<(), String> {
-        self.stop()?;
-        if self.selection.start >= self.selection.end || self.selection.end > self.sample.frames() {
-            return Err("Select a non-empty region first".into());
-        }
-        let file = tempfile::Builder::new()
-            .suffix(".wav")
-            .tempfile()
-            .map_err(|e| format!("Could not create preview: {e}"))?;
-        self.sample
-            .write_wav_range(file.path(), self.selection.clone())
-            .map_err(|e| format!("Could not write preview: {e}"))?;
-        self.play_file(file, self.selection.clone())
-    }
-
-    fn play_file(&mut self, file: tempfile::NamedTempFile, range: Range<usize>) -> Result<(), String> {
-        let mut command = Command::new("ffplay");
-        command.args(["-nodisp", "-autoexit", "-loglevel", "error"]);
-        if self.loop_preview {
-            command.args(["-loop", "0"]);
-        }
-        let child = command
-            .arg(file.path())
-            .stdout(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("Could not start ffplay: {e}"))?;
-        self.preview = Some(file);
-        self.player = Some(child);
-        self.playhead = Some((Instant::now(), range.start, range.end, self.loop_preview));
-        Ok(())
     }
 
     fn after_edit(&mut self, result: std::io::Result<()>) {
         match result {
             Ok(()) => {
+                let _ = self.stop();
                 self.stems = None;
                 self.selection = self.sample.play_range();
                 self.view_start = 0;
@@ -190,7 +251,7 @@ impl EditorView {
     }
 
     fn toggle_preview(&mut self) {
-        let result = if self.player.is_some() {
+        let result = if self.is_playing() {
             self.stop()
         } else {
             self.preview()
@@ -202,6 +263,7 @@ impl EditorView {
 
     fn do_undo(&mut self) {
         if self.sample.undo() {
+            let _ = self.stop();
             self.stems = None;
             self.selection = self.sample.play_range();
             self.pending_play = None;
@@ -213,6 +275,7 @@ impl EditorView {
 
     fn do_redo(&mut self) {
         if self.sample.redo() {
+            let _ = self.stop();
             self.stems = None;
             self.selection = self.sample.play_range();
             self.pending_play = None;
@@ -263,13 +326,21 @@ impl EditorView {
         match rx.try_recv() {
             Ok(Ok((set, range))) => {
                 self.stem_job = None;
+                let peaks = stem_peaks(
+                    &set,
+                    &range,
+                    usize::from(self.sample.channels),
+                    self.sample.frames(),
+                );
                 self.stems = Some(StemState {
                     set,
                     range,
                     include: [true; 4],
+                    removed: [false; 4],
+                    peaks,
                 });
                 self.message =
-                    "Stems ready: tick the ones to keep, then preview, apply or copy them.".into();
+                    "Stems ready: click a track's box to mute it, then preview, keep or copy them.".into();
             }
             Ok(Err(e)) => {
                 self.stem_job = None;
@@ -285,6 +356,51 @@ impl EditorView {
         }
     }
 
+    fn delete_stem(&mut self, stem: usize) {
+        let Some(state) = self.stems.as_mut() else { return };
+        state.removed[stem] = true;
+        state.include[stem] = false;
+        if state.live().is_empty() {
+            self.stems = None;
+            self.message = "All tracks deleted; showing the original waveform again.".into();
+        } else {
+            self.message = format!(
+                "Deleted the {} track. \"Keep ticked in sample\" applies what is left.",
+                STEM_NAMES[stem]
+            );
+        }
+        self.refresh_preview_source();
+    }
+
+    /// The whole track: the separated region when stems are showing, otherwise the sample.
+    fn whole_range(&self) -> Range<usize> {
+        match &self.stems {
+            Some(state) => state.range.clone(),
+            None => 0..self.sample.frames(),
+        }
+    }
+
+    /// The range a preview plays right now: the selection if there is one, else everything.
+    fn preview_target(&self) -> Range<usize> {
+        let selected = self.selection.start < self.selection.end
+            && self.selection.end <= self.sample.frames();
+        if !selected {
+            return self.whole_range();
+        }
+        match &self.stems {
+            Some(state) => {
+                let range =
+                    self.selection.start.max(state.range.start)..self.selection.end.min(state.range.end);
+                if range.start < range.end {
+                    range
+                } else {
+                    state.range.clone()
+                }
+            }
+            None => self.selection.clone(),
+        }
+    }
+
     fn stem_mix(&self) -> Result<(Vec<i16>, Range<usize>), String> {
         let state = self.stems.as_ref().ok_or("Separate stems first")?;
         let mix = state
@@ -292,23 +408,6 @@ impl EditorView {
             .mix(state.include)
             .ok_or("Tick at least one stem")?;
         Ok((mix, state.range.clone()))
-    }
-
-    fn preview_stem_mix(&mut self) {
-        let result = (|| -> Result<(), String> {
-            let (mix, range) = self.stem_mix()?;
-            self.stop()?;
-            let file = tempfile::Builder::new()
-                .suffix(".wav")
-                .tempfile()
-                .map_err(|e| format!("Could not create preview: {e}"))?;
-            ai::write_wav(file.path(), &mix, self.sample.channels, self.sample.sample_rate)
-                .map_err(|e| format!("Could not write preview: {e}"))?;
-            self.play_file(file, range)
-        })();
-        if let Err(e) = result {
-            self.message = e;
-        }
     }
 
     fn apply_stem_mix(&mut self) {
@@ -629,11 +728,16 @@ impl EditorView {
                 }
             }
         }
-        let channels = self.peaks.len();
+        let stem_ids: Vec<usize> = self.stems.as_ref().map(|s| s.live()).unwrap_or_default();
+        let stem_lanes = self.stems.is_some();
+        let channels = if stem_lanes { stem_ids.len().max(1) } else { self.peaks.len() };
         let buckets = self.peaks[0].len();
         let bucket_frames = frames.div_ceil(8192).max(1);
         let pixels = wave_rect.width().ceil().max(1.0) as usize;
+        let mut toggled_stem = None;
+        let mut deleted_stem = None;
         for channel in 0..channels {
+            let stem = if stem_lanes { stem_ids[channel] } else { channel };
             let lane = wave_rect.height() / channels as f32;
             let center = wave_rect.top() + lane * (channel as f32 + 0.5);
             if channel > 0 {
@@ -652,13 +756,25 @@ impl EditorView {
                 ],
                 Stroke::new(1.0, Color32::from_rgb(45, 52, 78)),
             );
+            let (data, color) = match &self.stems {
+                Some(state) => {
+                    let base = STEM_COLORS[stem];
+                    let color = if state.include[stem] {
+                        base
+                    } else {
+                        Color32::from_gray(80)
+                    };
+                    (&state.peaks[stem], color)
+                }
+                None => (&self.peaks[channel], Color32::from_rgb(226, 133, 205)),
+            };
             for pixel in 0..pixels {
                 let start = view_start + pixel * visible / pixels;
                 let end = view_start + (pixel + 1) * visible / pixels;
                 let first = (start / bucket_frames).min(buckets - 1);
                 let last = (end / bucket_frames).min(buckets - 1);
                 let (mut min, mut max) = (i16::MAX, i16::MIN);
-                for &(lo, hi) in &self.peaks[channel][first..=last] {
+                for &(lo, hi) in &data[first..=last] {
                     min = min.min(lo);
                     max = max.max(hi);
                 }
@@ -669,9 +785,59 @@ impl EditorView {
                         Pos2::new(px, center - max as f32 * scale),
                         Pos2::new(px, center - min as f32 * scale),
                     ],
-                    Stroke::new(1.0, Color32::from_rgb(226, 133, 205)),
+                    Stroke::new(1.0, color),
                 );
             }
+            if let Some(state) = &self.stems {
+                // Track header: click the box to mute or unmute, the cross to delete the track.
+                let top = wave_rect.top() + lane * channel as f32;
+                let header = Rect::from_min_size(
+                    Pos2::new(rect.left() + 22.0, top + 4.0),
+                    Vec2::new(96.0, 18.0),
+                );
+                let cross = Rect::from_min_size(
+                    Pos2::new(header.right() + 3.0, header.top()),
+                    Vec2::new(18.0, 18.0),
+                );
+                let button = ui.interact(header, ui.id().with(("stem_track", stem)), Sense::click());
+                if button.clicked() {
+                    toggled_stem = Some(stem);
+                }
+                let remove = ui
+                    .interact(cross, ui.id().with(("stem_delete", stem)), Sense::click())
+                    .on_hover_text("Delete this track");
+                if remove.clicked() {
+                    deleted_stem = Some(stem);
+                }
+                let on = state.include[stem];
+                painter.rect_filled(header, 3.0, Color32::from_black_alpha(if button.hovered() { 190 } else { 150 }));
+                let boxed = Rect::from_min_size(header.min + Vec2::new(4.0, 4.0), Vec2::splat(10.0));
+                painter.rect_stroke(boxed, 2.0, Stroke::new(1.0, STEM_COLORS[stem]), egui::StrokeKind::Inside);
+                if on {
+                    painter.rect_filled(boxed.shrink(2.0), 1.0, STEM_COLORS[stem]);
+                }
+                painter.text(
+                    Pos2::new(header.left() + 20.0, header.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    STEM_NAMES[stem],
+                    egui::FontId::proportional(11.0),
+                    if on { Color32::from_gray(225) } else { Color32::from_gray(130) },
+                );
+                painter.rect_filled(cross, 3.0, Color32::from_black_alpha(if remove.hovered() { 190 } else { 150 }));
+                painter.text(
+                    cross.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "x",
+                    egui::FontId::proportional(12.0),
+                    if remove.hovered() { Color32::from_rgb(255, 130, 120) } else { Color32::from_gray(190) },
+                );
+            }
+        }
+        if let Some(stem) = deleted_stem {
+            self.delete_stem(stem);
+        } else if let (Some(channel), Some(state)) = (toggled_stem, self.stems.as_mut()) {
+            state.include[channel] = !state.include[channel];
+            self.refresh_preview_source();
         }
 
         // Pad start/end markers: dim what the pad will not play, drag the handles to trim.
@@ -764,16 +930,87 @@ impl EditorView {
             }
         }
 
-        // Playhead while previewing.
-        if let Some((started, from, to, looping)) = self.playhead {
-            let length = to.saturating_sub(from).max(1) as f64;
-            let elapsed = started.elapsed().as_secs_f64() * sample_rate;
-            let position = from
-                + if looping {
-                    elapsed % length
+        // Selection edges: grab the edge line anywhere along its height (every channel lane)
+        // or the tab at the bottom. The strip under the pad S/E flags stays with the pad handles.
+        if self.selection.start < self.selection.end {
+            let selection = self.selection.clone();
+            let mut new_selection = selection.clone();
+            for (is_start, frame) in [(true, selection.start), (false, selection.end)] {
+                if !in_view(frame) {
+                    continue;
+                }
+                let hx = x(frame);
+                let line_zone = Rect::from_min_max(
+                    Pos2::new(hx - 9.0, wave_rect.top() + 24.0),
+                    Pos2::new(hx + 9.0, wave_rect.bottom()),
+                );
+                // The tab is drawn inward from the edge; its whole area plus a margin is grabbable.
+                let tab_zone = if is_start {
+                    Rect::from_min_max(
+                        Pos2::new(hx - 9.0, wave_rect.bottom() - 36.0),
+                        Pos2::new(hx + SELECTION_TAB_WIDTH + 6.0, wave_rect.bottom()),
+                    )
                 } else {
-                    elapsed.min(length)
-                } as usize;
+                    Rect::from_min_max(
+                        Pos2::new(hx - SELECTION_TAB_WIDTH - 6.0, wave_rect.bottom() - 36.0),
+                        Pos2::new(hx + 9.0, wave_rect.bottom()),
+                    )
+                };
+                let mut active = false;
+                let mut pointer = None;
+                for (part, zone) in [line_zone, tab_zone].into_iter().enumerate() {
+                    let handle = ui.interact(
+                        zone,
+                        ui.id().with(("selection_handle", is_start, part)),
+                        Sense::drag(),
+                    );
+                    active |= handle.hovered() || handle.dragged();
+                    if handle.dragged() {
+                        pointer = handle.interact_pointer_pos();
+                        handle_busy = true;
+                    }
+                }
+                if active {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                }
+                if let Some(pos) = pointer {
+                    let target = frame_at(pos);
+                    if is_start {
+                        new_selection.start = target.min(selection.end.saturating_sub(1));
+                    } else {
+                        new_selection.end = target.max(selection.start + 1).min(frames);
+                    }
+                }
+                let color = if active {
+                    Color32::from_rgb(190, 215, 255)
+                } else {
+                    Color32::from_rgb(130, 165, 235)
+                };
+                painter.line_segment(
+                    [Pos2::new(hx, wave_rect.top()), Pos2::new(hx, wave_rect.bottom())],
+                    Stroke::new(if active { 2.5 } else { 1.5 }, color),
+                );
+                let tab = Rect::from_min_size(
+                    Pos2::new(
+                        if is_start { hx } else { hx - SELECTION_TAB_WIDTH },
+                        wave_rect.bottom() - 30.0,
+                    ),
+                    Vec2::new(SELECTION_TAB_WIDTH, 30.0),
+                );
+                painter.rect_filled(tab, 3.0, color);
+                painter.text(
+                    tab.center(),
+                    egui::Align2::CENTER_CENTER,
+                    if is_start { "[" } else { "]" },
+                    egui::FontId::proportional(14.0),
+                    Color32::BLACK,
+                );
+            }
+            self.selection = new_selection;
+        }
+
+        // Playhead while previewing: the real play position from the audio engine.
+        if let Some(position) = self.audio.as_ref().and_then(|player| player.position()) {
             if in_view(position) {
                 let px = x(position);
                 painter.line_segment(
@@ -803,6 +1040,11 @@ impl EditorView {
                     self.selection = anchor.min(current)..anchor.max(current);
                 }
             }
+        }
+        if response.double_clicked() && !handle_busy {
+            // Double-click any track (or the only waveform) to select it whole.
+            self.selection = self.whole_range();
+            self.anchor = None;
         }
         if response.drag_stopped() {
             self.anchor = None;
@@ -966,19 +1208,9 @@ impl EditorView {
     pub fn show(&mut self, ctx: &egui::Context, class: egui::ViewportClass) -> Action {
         self.poll_ai_job(ctx);
         self.poll_stem_job(ctx);
-        if let Some(child) = self.player.as_mut() {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    self.player = None;
-                    self.preview = None;
-                    self.playhead = None;
-                    if !status.success() {
-                        self.message = format!("Preview failed: {status}");
-                    }
-                }
-                Ok(None) => ctx.request_repaint_after(std::time::Duration::from_millis(250)),
-                Err(e) => self.message = format!("Could not check preview: {e}"),
-            }
+        self.sync_live_preview();
+        if self.is_playing() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
         if !ctx.wants_keyboard_input() {
             use egui::{Key, Modifiers};
@@ -1046,11 +1278,11 @@ impl EditorView {
 
                     Self::group_label(ui, "PLAYBACK");
                     ui.horizontal(|ui| {
-                        let playing = self.player.is_some();
-                        let label = if playing { "Restart preview" } else { "Preview selection" };
+                        let playing = self.is_playing();
+                        let label = if playing { "Restart" } else { "Preview" };
                         if ui
                             .add(Self::primary(label, true))
-                            .on_hover_text("Play the selected region (Space toggles play/stop)")
+                            .on_hover_text("Play the selection, or everything when nothing is selected (Space toggles play/stop)")
                             .clicked()
                         {
                             if let Err(e) = self.preview() {
@@ -1194,6 +1426,8 @@ impl EditorView {
                         });
                     });
 
+                    let mut discard_stems = false;
+                    let mut stems_changed = false;
                     ui.collapsing("Stems (AI separation)", |ui| {
                         let range = self.stem_range();
                         ui.horizontal_wrapped(|ui| {
@@ -1214,13 +1448,18 @@ impl EditorView {
                         if let Some(state) = self.stems.as_mut() {
                             ui.horizontal_wrapped(|ui| {
                                 for (i, name) in STEM_NAMES.iter().enumerate() {
-                                    ui.checkbox(&mut state.include[i], *name);
+                                    if state.removed[i] {
+                                        continue;
+                                    }
+                                    if ui.checkbox(&mut state.include[i], *name).changed() {
+                                        stems_changed = true;
+                                    }
+                                }
+                                if ui.add(Self::button("Back to original", true)).clicked() {
+                                    discard_stems = true;
                                 }
                             });
                             ui.horizontal_wrapped(|ui| {
-                                if ui.add(Self::button("Preview mix", true)).clicked() {
-                                    self.preview_stem_mix();
-                                }
                                 if ui
                                     .add(Self::button("Keep ticked in sample", true))
                                     .on_hover_text("Replace the separated region with the sum of the ticked stems")
@@ -1253,6 +1492,14 @@ impl EditorView {
                             });
                         }
                     });
+
+                    if stems_changed {
+                        self.refresh_preview_source();
+                    }
+                    if discard_stems {
+                        self.stems = None;
+                        self.message = "Showing the original waveform again.".into();
+                    }
 
                     ui.separator();
                     if !self.message.is_empty() {
@@ -1324,16 +1571,21 @@ mod tests {
     use std::io::Write;
 
     fn test_editor() -> EditorView {
+        test_editor_with_channels(1)
+    }
+
+    fn test_editor_with_channels(channels: u16) -> EditorView {
+        let block = 2 * channels;
         let mut wav = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
         wav.write_all(b"RIFF").unwrap();
         wav.write_all(&2036u32.to_le_bytes()).unwrap();
         wav.write_all(b"WAVEfmt ").unwrap();
         wav.write_all(&16u32.to_le_bytes()).unwrap();
         wav.write_all(&1u16.to_le_bytes()).unwrap();
-        wav.write_all(&1u16.to_le_bytes()).unwrap();
+        wav.write_all(&channels.to_le_bytes()).unwrap();
         wav.write_all(&1000u32.to_le_bytes()).unwrap();
-        wav.write_all(&2000u32.to_le_bytes()).unwrap();
-        wav.write_all(&2u16.to_le_bytes()).unwrap();
+        wav.write_all(&(1000 * u32::from(block)).to_le_bytes()).unwrap();
+        wav.write_all(&block.to_le_bytes()).unwrap();
         wav.write_all(&16u16.to_le_bytes()).unwrap();
         wav.write_all(b"data").unwrap();
         wav.write_all(&2000u32.to_le_bytes()).unwrap();
@@ -1346,7 +1598,7 @@ mod tests {
             file_size: Some(2044),
             start: 512,
             end: 2512,
-            channels: 1,
+            channels: u8::try_from(channels).unwrap(),
             settings: sp404sx_wave_converter::PadSettings::default(),
         };
         EditorView::open(PathBuf::new(), pad).unwrap()
@@ -1389,6 +1641,190 @@ mod tests {
         assert!((editor.selection.end as isize - 600).abs() <= 5);
     }
 
+    fn drag(editor: &mut EditorView, from: Pos2, to: Pos2) {
+        let ctx = egui::Context::default();
+        let mut frame = |events| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(500.0, 300.0))),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| editor.waveform(ui));
+            });
+        };
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(vec![]);
+        frame(vec![egui::Event::PointerMoved(from), button(from, true)]);
+        frame(vec![egui::Event::PointerMoved(to)]);
+        frame(vec![button(to, false)]);
+    }
+
+    #[test]
+    fn selection_edges_can_be_grabbed_and_refined() {
+        let mut editor = test_editor();
+        editor.selection = 200..600;
+        // About 0.484 px per frame starting at x = 7.6; the tabs live in the lower half.
+        drag(&mut editor, Pos2::new(104.0, 190.0), Pos2::new(150.0, 190.0));
+        assert!((editor.selection.start as isize - 294).abs() <= 6, "{:?}", editor.selection);
+        assert_eq!(editor.selection.end, 600);
+        drag(&mut editor, Pos2::new(298.0, 190.0), Pos2::new(250.0, 190.0));
+        assert!((editor.selection.end as isize - 500).abs() <= 6, "{:?}", editor.selection);
+        assert!((editor.selection.start as isize - 294).abs() <= 6);
+        assert_eq!(editor.sample.play_range(), 0..1000);
+
+        // The tabs are drawn inward from the edge; grabbing their far side must work too.
+        let mut editor = test_editor();
+        editor.selection = 200..600;
+        drag(&mut editor, Pos2::new(104.4 + 17.0, 195.0), Pos2::new(160.0, 195.0));
+        assert!((editor.selection.start as isize - 315).abs() <= 6, "{:?}", editor.selection);
+        assert_eq!(editor.selection.end, 600);
+        drag(&mut editor, Pos2::new(298.0 - 17.0, 195.0), Pos2::new(240.0, 195.0));
+        assert!((editor.selection.end as isize - 480).abs() <= 6, "{:?}", editor.selection);
+        assert!((editor.selection.start as isize - 315).abs() <= 6);
+    }
+
+    #[test]
+    fn selection_edges_can_be_grabbed_in_both_stereo_channel_lanes() {
+        // Pixels per frame: the waveform spans about 484 px starting near x = 7.6.
+        for lane_y in [70.0, 160.0] {
+            let mut editor = test_editor_with_channels(2);
+            assert_eq!(editor.sample.channels, 2);
+            let frames = editor.sample.frames() as f32;
+            let px = |frame: f32| 7.6 + frame / frames * 484.4;
+            editor.selection = 100..300;
+            drag(&mut editor, Pos2::new(px(100.0), lane_y), Pos2::new(px(150.0), lane_y));
+            assert!((editor.selection.start as isize - 150).abs() <= 4, "{lane_y}: {:?}", editor.selection);
+            drag(&mut editor, Pos2::new(px(300.0), lane_y), Pos2::new(px(260.0), lane_y));
+            assert!((editor.selection.end as isize - 260).abs() <= 4, "{lane_y}: {:?}", editor.selection);
+            assert!((editor.selection.start as isize - 150).abs() <= 4);
+        }
+    }
+
+    #[test]
+    fn preview_plays_the_selection_or_everything_when_nothing_is_selected() {
+        let mut editor = test_editor();
+        editor.selection = 100..300;
+        assert_eq!(editor.preview_target(), 100..300);
+        editor.selection = 150..300;
+        assert_eq!(editor.preview_target(), 150..300);
+        editor.selection = 150..150;
+        assert_eq!(editor.preview_target(), 0..1000, "no selection plays everything");
+        editor.selection = 900..2000;
+        assert_eq!(editor.preview_target(), 0..1000, "an out-of-range selection plays everything");
+    }
+
+    #[test]
+    fn double_click_selects_the_whole_track() {
+        let mut editor = test_editor();
+        editor.selection = 100..300;
+        let ctx = egui::Context::default();
+        let pos = Pos2::new(200.0, 120.0);
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut time = 1.0;
+        let mut frame = |events: Vec<egui::Event>| {
+            time += 0.05;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(500.0, 300.0))),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| editor.waveform(ui));
+            });
+        };
+        frame(vec![]);
+        frame(vec![egui::Event::PointerMoved(pos)]);
+        for _ in 0..2 {
+            frame(vec![button(true)]);
+            frame(vec![button(false)]);
+        }
+        assert_eq!(editor.selection, 0..1000);
+    }
+
+    #[test]
+    fn double_click_on_stems_selects_the_separated_region() {
+        let mut editor = test_editor();
+        let set = StemSet {
+            stems: [vec![0; 600], vec![0; 600], vec![0; 600], vec![0; 600]],
+        };
+        editor.stems = Some(StemState {
+            peaks: stem_peaks(&set, &(200..800), 1, 1000),
+            set,
+            range: 200..800,
+            include: [true; 4],
+            removed: [false; 4],
+        });
+        editor.selection = 300..400;
+        assert_eq!(editor.preview_target(), 300..400);
+        editor.selection = 0..0;
+        assert_eq!(editor.preview_target(), 200..800);
+        assert_eq!(editor.whole_range(), 200..800);
+    }
+
+    #[test]
+    fn deleted_stem_tracks_leave_the_mix_and_the_last_one_ends_the_view() {
+        let mut editor = test_editor();
+        let set = StemSet {
+            stems: [vec![1; 1000], vec![10; 1000], vec![100; 1000], vec![1000; 1000]],
+        };
+        editor.stems = Some(StemState {
+            peaks: stem_peaks(&set, &(0..1000), 1, 1000),
+            set,
+            range: 0..1000,
+            include: [true; 4],
+            removed: [false; 4],
+        });
+        editor.selection = 0..10;
+        editor.delete_stem(3);
+        assert_eq!(editor.stems.as_ref().unwrap().live(), vec![0, 1, 2]);
+        assert!(editor.preview_source().unwrap().audio.iter().all(|s| *s == 111));
+        editor.delete_stem(0);
+        editor.delete_stem(1);
+        assert!(editor.preview_source().unwrap().audio.iter().all(|s| *s == 100));
+        editor.delete_stem(2);
+        assert!(editor.stems.is_none());
+    }
+
+    #[test]
+    fn muted_stems_are_left_out_of_the_preview() {
+        let mut editor = test_editor();
+        let mut set = StemSet {
+            stems: [vec![1; 1000], vec![10; 1000], vec![100; 1000], vec![1000; 1000]],
+        };
+        set.stems[0][0] = 5;
+        editor.stems = Some(StemState {
+            peaks: stem_peaks(&set, &(0..1000), 1, 1000),
+            set,
+            range: 0..1000,
+            include: [true, false, true, false],
+            removed: [false; 4],
+        });
+        editor.selection = 100..200;
+        assert_eq!(editor.preview_target(), 100..200);
+        let source = editor.preview_source().unwrap();
+        assert_eq!(source.origin, 0);
+        assert!(source.audio[100..200].iter().all(|s| *s == 101), "muted stems leaked into the mix");
+        editor.selection = 100..100;
+        assert_eq!(editor.preview_target(), 0..1000);
+        editor.stems.as_mut().unwrap().include = [false; 4];
+        assert!(editor.preview_source().unwrap_err().contains("muted"));
+        editor.stems.as_mut().unwrap().include = [true; 4];
+        editor.selection = 2000..2100;
+        assert_eq!(editor.preview_target(), 0..1000, "a selection outside the stems plays everything");
+    }
+
     #[test]
     fn native_close_is_cancelled_until_the_editor_decides_to_close() {
         let mut editor = test_editor();
@@ -1409,53 +1845,5 @@ mod tests {
             .commands
             .iter()
             .any(|command| matches!(command, egui::ViewportCommand::CancelClose)));
-    }
-
-    #[test]
-    fn empty_preview_selection_is_rejected() {
-        let mut editor = test_editor();
-        editor.selection = 2..2;
-        assert!(editor.preview().unwrap_err().contains("non-empty"));
-        assert!(editor.player.is_none());
-        assert!(editor.preview.is_none());
-    }
-
-    #[test]
-    #[ignore = "requires ffplay and a working audio backend"]
-    fn loop_preview_keeps_its_file_until_stopped_and_one_shot_exits() {
-        let mut editor = test_editor();
-        editor.selection = 0..100;
-        editor.loop_preview = true;
-        editor.preview().unwrap();
-        let path = editor.preview.as_ref().unwrap().path().to_owned();
-        std::thread::sleep(std::time::Duration::from_secs(5));
-        assert!(path.exists());
-        assert!(editor
-            .player
-            .as_mut()
-            .unwrap()
-            .try_wait()
-            .unwrap()
-            .is_none());
-        editor.stop().unwrap();
-        assert!(!path.exists());
-        assert!(editor.player.is_none());
-
-        editor.loop_preview = false;
-        editor.preview().unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
-        loop {
-            if let Some(status) = editor.player.as_mut().unwrap().try_wait().unwrap() {
-                assert!(status.success());
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "one-shot preview did not exit"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        editor.stop().unwrap();
-        assert!(editor.preview.is_none());
     }
 }

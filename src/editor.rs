@@ -118,6 +118,9 @@ impl SampleEditor {
     pub fn frames(&self) -> usize {
         self.state.samples.len() / usize::from(self.channels)
     }
+    pub fn samples_arc(&self) -> Arc<Vec<i16>> {
+        Arc::clone(&self.state.samples)
+    }
     pub fn samples(&self) -> &[i16] {
         &self.state.samples
     }

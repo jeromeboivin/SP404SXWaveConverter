@@ -6,10 +6,11 @@ description = "SP-404SX/A card sample manager"
 
 [features]
 default = ["gui"]
-gui = ["dep:eframe", "dep:rfd"]
+gui = ["dep:eframe", "dep:rfd", "dep:cpal"]
 
 [dependencies]
 beat-this = { version = "1.1.0", default-features = false }
+cpal = { version = "0.18.2", optional = true }
 eframe = { version = "0.31", optional = true, default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
 rfd = { version = "0.15", optional = true }
 sha2 = "0.10"
