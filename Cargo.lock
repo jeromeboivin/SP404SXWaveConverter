@@ -4123,7 +4123,7 @@ dependencies = [
 
 [[package]]
 name = "sp404sx-wave-converter"
-version = "0.1.0"
+version = "0.1.1-rc1"
 dependencies = [
  "beat-this",
  "cpal",
