@@ -15,6 +15,38 @@ operation.
 cargo run -- gui /path/to/card
 ```
 
+## Sample editor
+
+Select a pad and click **Edit** to open a waveform editor with some audio
+tools you would normally need a DAW for:
+
+![Sample editor with four separated tracks](assets/editor-tracks.png)
+
+- **Stem separation:** split a sample into vocals, drums, bass and other with
+  htdemucs. Each stem becomes its own track: mute it, delete it, preview the
+  mix, keep the ticked tracks in the sample, or copy the mix or every stem to
+  free pads.
+- **Pitch change without tempo change:** each track's note is detected
+  automatically (for example `A2`); pick a target note or a number of
+  semitones and apply it to the ticked tracks, with undo.
+- **Tempo change without pitch change:** set a target BPM for the beat grid and
+  stretch the sample with Signalsmith Stretch.
+- **Beat detection:** the classic onset-based detector, or a neural beat tracker
+  (**Detect (AI)**, beat-this) for a more reliable BPM and grid.
+- **Live looping preview:** the loop follows your selection as you drag its edges,
+  without restarting. Drag the `[` `]` tabs on any track, or double-click a
+  track to select all of it.
+- **Save to pad** renders the sample as Preview plays it, and asks whether to
+  trim to your selection when only part of the sample is selected.
+
+![Stem, pitch and save controls](assets/editor-controls.png)
+
+The AI features download their models on first use: about 85 MB for beat
+detection into `~/.sp404sx-wave-converter/models`, and about 210 MB for stem
+separation into the cache folder of the `stem-splitter-core` library. Analysis
+runs on the CPU, so separating a long sample takes a while. Pitch and stem
+results are approximate and depend on the material.
+
 On Linux, build and install the application and desktop launcher with:
 
 ```sh
@@ -39,11 +71,12 @@ click an empty pad to import audio. To replace a sample, select its pad and use
 deletion require confirmation. Double-click an assigned pad to preview it;
 click the playing pad or **Stop** to stop.
 
-To copy or move a sample, select its source pad, choose a destination bank and
-pad, and click **Copy** or **Move**. The destination must be empty. **Swap**
-exchanges two occupied pads. These operations retain the samples and their pad
-settings, and move and swap require confirmation. The controls may be below
-the fold in a small window.
+To copy or exchange samples, click **Copy** or **Exchange** (the SP-404SX's
+CPY and CHG operations), pick the source pad, then the destination pad in any
+bank, and press the blinking **REC** to confirm; **Cancel** or Esc aborts. Copy
+needs an empty destination. Exchange swaps two occupied pads, or moves the
+sample if the destination is empty. These operations retain the samples and
+their pad settings.
 
 Select an assigned pad and click **Edit** to open its waveform in a separate
 window. Main-window controls are disabled until the editor is closed; the main
@@ -79,8 +112,9 @@ off after edits or undo/redo until the grid is checked again. Grid changes
 do not modify the pad's stored tempo.
 
 Editing keeps the decoded sample and audio-edit undo/redo copies in memory.
-Long samples or many edits can use substantial memory; loading, analysis, preview
-creation, and saving run synchronously and may temporarily freeze the window.
+Long samples or many edits can use substantial memory; loading and saving run
+synchronously and may temporarily freeze the window, while beat detection,
+stem separation and pitch changes run in the background.
 
 Import requires `ffmpeg` and `ffprobe` on `PATH` and accepts audio formats
 supported by the installed FFmpeg. Audio is converted to WAV, preserving the
@@ -105,7 +139,9 @@ cargo run -- play /path/to/card A 1
 
 For a CLI-only build, use `cargo build --no-default-features`. Linux GUI builds
 need the system libraries required by `eframe`/`winit` and a native file dialog
-backend.
+backend, plus the ALSA development files (`libasound2-dev` on Debian/Ubuntu) for
+audio output and the clang headers (`libclang-dev`) used to build the time-stretch
+bindings.
 
 ## Recovery and limitations
 
