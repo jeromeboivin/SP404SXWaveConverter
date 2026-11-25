@@ -953,7 +953,7 @@ impl eframe::App for App {
             match action {
                 EditorAction::None => self.editor = Some(editor),
                 EditorAction::Close => {
-                    if editor.sample.can_undo()
+                    if editor.has_unsaved_changes()
                         && !Self::confirm("Discard edits?", "Discard the unsaved sample edits?")
                     {
                         self.editor = Some(editor);

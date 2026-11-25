@@ -162,6 +162,207 @@ pub fn stretch(
     Ok(output)
 }
 
+/// A detected musical pitch.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pitch {
+    /// Fractional MIDI note number (69.0 = A4 = 440 Hz).
+    pub midi: f64,
+    /// 0..1: how steady and clearly pitched the signal was.
+    pub confidence: f64,
+}
+
+impl Pitch {
+    pub fn hz(&self) -> f64 {
+        440.0 * 2f64.powf((self.midi - 69.0) / 12.0)
+    }
+
+    pub fn nearest_note(&self) -> i32 {
+        self.midi.round() as i32
+    }
+
+    /// Distance from the nearest note in cents (-50..50).
+    pub fn cents(&self) -> i32 {
+        ((self.midi - self.midi.round()) * 100.0).round() as i32
+    }
+}
+
+const NOTE_NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+
+/// Note name for a MIDI number, with C4 = 60 (so A4 = 69 and D2 = 38).
+pub fn note_name(midi: i32) -> String {
+    format!(
+        "{}{}",
+        NOTE_NAMES[midi.rem_euclid(12) as usize],
+        midi.div_euclid(12) - 1
+    )
+}
+
+/// Parse a note such as "D2", "a#3" or "Bb1" into a MIDI number.
+pub fn parse_note(text: &str) -> Option<i32> {
+    let text = text.trim();
+    let mut chars = text.chars();
+    let letter = chars.next()?.to_ascii_uppercase();
+    let mut semitone = match letter {
+        'C' => 0,
+        'D' => 2,
+        'E' => 4,
+        'F' => 5,
+        'G' => 7,
+        'A' => 9,
+        'B' => 11,
+        _ => return None,
+    };
+    let rest: String = chars.collect();
+    let rest = if let Some(r) = rest.strip_prefix('#') {
+        semitone += 1;
+        r
+    } else if let Some(r) = rest.strip_prefix('b') {
+        semitone -= 1;
+        r
+    } else {
+        rest.as_str()
+    };
+    let octave: i32 = rest.parse().ok()?;
+    Some((octave + 1) * 12 + semitone)
+}
+
+/// Estimate the dominant pitch of `samples` (interleaved i16) with the YIN algorithm:
+/// frame-wise autocorrelation-style analysis, then the most common note wins. Returns `None`
+/// for silence, noise or material without a steady fundamental (most drums).
+pub fn detect_pitch(samples: &[i16], channels: u16, sample_rate: u32) -> Option<Pitch> {
+    const MIN_HZ: f32 = 30.0;
+    const MAX_HZ: f32 = 1500.0;
+    const WINDOW: usize = 1024;
+    const HOP: usize = 512;
+    const MAX_FRAMES: usize = 240;
+    let channels = usize::from(channels.max(1));
+    // Mono at roughly 11 kHz: plenty for fundamentals up to 1.5 kHz and much cheaper.
+    let decimation = ((sample_rate as f32 / 11025.0).round() as usize).max(1);
+    let rate = sample_rate as f32 / decimation as f32;
+    let mono: Vec<f32> = samples
+        .chunks_exact(channels * decimation)
+        .map(|group| group.iter().map(|s| f32::from(*s)).sum::<f32>() / (group.len() as f32 * 32768.0))
+        .collect();
+    let tau_min = ((rate / MAX_HZ).floor() as usize).max(2);
+    let tau_max = (rate / MIN_HZ).ceil() as usize;
+    let frame_len = WINDOW + tau_max + 1;
+    if mono.len() < frame_len + HOP {
+        return None;
+    }
+    let rms_of = |start: usize| -> f32 {
+        (mono[start..start + WINDOW].iter().map(|v| v * v).sum::<f32>() / WINDOW as f32).sqrt()
+    };
+    let starts: Vec<usize> = (0..=mono.len() - frame_len).step_by(HOP).collect();
+    let stride = starts.len().div_ceil(MAX_FRAMES).max(1);
+    let starts: Vec<usize> = starts.into_iter().step_by(stride).collect();
+    let peak = starts.iter().map(|s| rms_of(*s)).fold(0.0f32, f32::max);
+    let floor = (peak * 0.1).max(0.002);
+
+    let mut voiced: Vec<(f64, f64)> = Vec::new(); // (midi, weight)
+    let mut active = 0usize;
+    let mut diff = vec![0f32; tau_max + 1];
+    for start in starts {
+        let rms = rms_of(start);
+        if rms < floor {
+            continue;
+        }
+        active += 1;
+        for tau in 1..=tau_max {
+            let mut sum = 0.0;
+            for j in 0..WINDOW {
+                let d = mono[start + j] - mono[start + j + tau];
+                sum += d * d;
+            }
+            diff[tau] = sum;
+        }
+        // Cumulative mean normalised difference.
+        let mut cmnd = vec![1.0f32; tau_max + 1];
+        let mut running = 0.0;
+        for tau in 1..=tau_max {
+            running += diff[tau];
+            cmnd[tau] = if running > 0.0 { diff[tau] * tau as f32 / running } else { 1.0 };
+        }
+        let mut found = None;
+        let mut tau = tau_min;
+        while tau < tau_max {
+            if cmnd[tau] < 0.15 {
+                while tau + 1 < tau_max && cmnd[tau + 1] < cmnd[tau] {
+                    tau += 1;
+                }
+                found = Some(tau);
+                break;
+            }
+            tau += 1;
+        }
+        let Some(tau) = found else { continue };
+        // Parabolic interpolation around the minimum.
+        let (a, b, c) = (cmnd[tau - 1], cmnd[tau], cmnd[(tau + 1).min(tau_max)]);
+        let denominator = a - 2.0 * b + c;
+        let shift = if denominator.abs() > 1e-9 { 0.5 * (a - c) / denominator } else { 0.0 };
+        let hz = rate / (tau as f32 + shift.clamp(-1.0, 1.0));
+        if !(MIN_HZ..=MAX_HZ).contains(&hz) {
+            continue;
+        }
+        let midi = 69.0 + 12.0 * (f64::from(hz) / 440.0).log2();
+        voiced.push((midi, f64::from((1.0 - b).clamp(0.0, 1.0) * rms)));
+    }
+    if voiced.len() < 3 || active == 0 {
+        return None;
+    }
+    // The most common semitone wins; average the frames that agree with it.
+    let mut bins = std::collections::BTreeMap::<i32, f64>::new();
+    for (midi, weight) in &voiced {
+        *bins.entry(midi.round() as i32).or_default() += weight;
+    }
+    let (&best, _) = bins.iter().max_by(|a, b| a.1.total_cmp(b.1))?;
+    let agreeing: Vec<&(f64, f64)> = voiced
+        .iter()
+        .filter(|(midi, _)| (midi - f64::from(best)).abs() <= 0.5)
+        .collect();
+    let total_weight: f64 = agreeing.iter().map(|(_, w)| w).sum();
+    if agreeing.len() < 3 || total_weight <= 0.0 {
+        return None;
+    }
+    let fraction = agreeing.len() as f64 / active as f64;
+    if fraction < 0.3 {
+        return None;
+    }
+    let midi = agreeing.iter().map(|(m, w)| m * w).sum::<f64>() / total_weight;
+    Some(Pitch {
+        midi,
+        confidence: fraction.clamp(0.0, 1.0),
+    })
+}
+
+/// Shift pitch by `semitones` without changing duration or tempo (Signalsmith Stretch,
+/// default quality preset). Same length out as in.
+pub fn pitch_shift(
+    input: &[i16],
+    channels: u16,
+    sample_rate: u32,
+    semitones: f64,
+) -> io::Result<Vec<i16>> {
+    if !semitones.is_finite() || semitones.abs() > 48.0 {
+        return Err(invalid("pitch shift must be within four octaves"));
+    }
+    if semitones == 0.0 {
+        return Ok(input.to_vec());
+    }
+    let channels_usize = usize::from(channels.max(1));
+    if input.is_empty() || input.len() % channels_usize != 0 {
+        return Err(invalid("nothing to shift"));
+    }
+    let audio: Vec<f32> = input.iter().map(|s| f32::from(*s) / 32768.0).collect();
+    let mut shifter = Stretch::preset_default(u32::from(channels), sample_rate);
+    shifter.set_transpose_factor_semitones(semitones as f32, None);
+    let mut output = vec![0.0f32; audio.len()];
+    shifter.exact(&audio, &mut output);
+    Ok(output
+        .into_iter()
+        .map(|v| (v * 32768.0).round().clamp(-32768.0, 32767.0) as i16)
+        .collect())
+}
+
 /// Stem names in the order used by [`StemSet::stems`].
 pub const STEM_NAMES: [&str; 4] = ["vocals", "drums", "bass", "other"];
 
@@ -365,5 +566,80 @@ mod tests {
         let path = dir.path().join("t.wav");
         write_wav(&path, &[1, -2, 3, -4], 2, 22050).unwrap();
         assert_eq!(read_wav(&path).unwrap(), (vec![1, -2, 3, -4], 2, 22050));
+    }
+    fn tone(hz: f64, seconds: f64, rate: u32, harmonics: &[f64]) -> Vec<i16> {
+        (0..(rate as f64 * seconds) as usize)
+            .map(|i| {
+                let t = i as f64 / f64::from(rate);
+                let v: f64 = harmonics
+                    .iter()
+                    .enumerate()
+                    .map(|(k, a)| a * (std::f64::consts::TAU * hz * (k + 1) as f64 * t).sin())
+                    .sum();
+                (v * 9000.0) as i16
+            })
+            .collect()
+    }
+
+    #[test]
+    fn note_names_round_trip() {
+        assert_eq!(note_name(38), "D2");
+        assert_eq!(note_name(57), "A3");
+        assert_eq!(note_name(60), "C4");
+        assert_eq!(note_name(69), "A4");
+        assert_eq!(note_name(25), "C#1");
+        for midi in 12..=108 {
+            assert_eq!(parse_note(&note_name(midi)), Some(midi));
+        }
+        assert_eq!(parse_note("bb1"), Some(34));
+        assert_eq!(parse_note("d2"), Some(38));
+        assert_eq!(parse_note("H2"), None);
+        assert_eq!(parse_note("D"), None);
+    }
+
+    #[test]
+    fn detects_low_and_mid_notes_even_with_a_weak_fundamental() {
+        for (hz, expected) in [(73.416, 38), (220.0, 57), (110.0, 45), (987.77, 83)] {
+            let pcm = tone(hz, 2.0, 44100, &[1.0, 0.4]);
+            let pitch = detect_pitch(&pcm, 1, 44100).unwrap_or_else(|| panic!("no pitch for {hz}"));
+            assert_eq!(pitch.nearest_note(), expected, "{hz} Hz -> {pitch:?}");
+            assert!(pitch.cents().abs() <= 10, "{hz} Hz is {} cents off", pitch.cents());
+        }
+        // Fundamental much weaker than its 2nd harmonic: still the real fundamental.
+        let pcm = tone(73.416, 2.0, 44100, &[0.35, 1.0, 0.5]);
+        assert_eq!(detect_pitch(&pcm, 1, 44100).unwrap().nearest_note(), 38);
+        // Stereo at a lower rate.
+        let mono = tone(130.81, 2.0, 22050, &[1.0, 0.5]);
+        let stereo: Vec<i16> = mono.iter().flat_map(|s| [*s, *s]).collect();
+        assert_eq!(detect_pitch(&stereo, 2, 22050).unwrap().nearest_note(), 48);
+    }
+
+    #[test]
+    fn silence_and_noise_have_no_pitch() {
+        assert!(detect_pitch(&vec![0i16; 44100 * 2], 1, 44100).is_none());
+        let mut seed = 7u32;
+        let noise: Vec<i16> = (0..44100 * 2)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((seed >> 16) as i16) / 3
+            })
+            .collect();
+        assert!(detect_pitch(&noise, 1, 44100).is_none());
+        assert!(detect_pitch(&[1, 2, 3], 1, 44100).is_none());
+    }
+
+    #[test]
+    fn pitch_shift_moves_the_note_and_keeps_the_length() {
+        let pcm = tone(73.416, 3.0, 44100, &[1.0, 0.4]); // D2
+        let up = pitch_shift(&pcm, 1, 44100, 19.0).unwrap(); // D2 -> A3
+        assert_eq!(up.len(), pcm.len());
+        let pitch = detect_pitch(&up, 1, 44100).unwrap();
+        assert_eq!(pitch.nearest_note(), 57, "{pitch:?}");
+        assert!(pitch.cents().abs() <= 25, "{} cents", pitch.cents());
+        let down = pitch_shift(&pcm, 1, 44100, -12.0).unwrap();
+        assert_eq!(down.len(), pcm.len());
+        assert_eq!(pitch_shift(&pcm, 1, 44100, 0.0).unwrap(), pcm);
+        assert!(pitch_shift(&pcm, 1, 44100, 100.0).is_err());
+        assert!(pitch_shift(&[], 1, 44100, 3.0).is_err());
     }
 }

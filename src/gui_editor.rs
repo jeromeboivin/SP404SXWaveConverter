@@ -1,6 +1,6 @@
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use crate::player::{Player, Source};
-use sp404sx_wave_converter::ai::{self, StemSet, STEM_NAMES};
+use sp404sx_wave_converter::ai::{self, Pitch, StemSet, STEM_NAMES};
 use sp404sx_wave_converter::editor::{BeatGrid, SampleEditor};
 use sp404sx_wave_converter::Pad;
 use std::ops::Range;
@@ -23,6 +23,10 @@ struct StemState {
     removed: [bool; 4],
     /// Per-stem min/max buckets over the whole timeline (silent outside `range`).
     peaks: Vec<Vec<(i16, i16)>>,
+    /// Dominant note of each track, when it has a clear pitch.
+    pitch: [Option<Pitch>; 4],
+    /// Earlier audio, restored by "Undo pitch".
+    history: Vec<([Vec<i16>; 4], [Option<Pitch>; 4])>,
 }
 
 impl StemState {
@@ -30,6 +34,15 @@ impl StemState {
     fn live(&self) -> Vec<usize> {
         (0..4).filter(|i| !self.removed[*i]).collect()
     }
+}
+
+/// A drag box that shows and accepts note names such as "D2" or "A#3".
+fn note_drag(value: &mut f64) -> egui::DragValue<'_> {
+    egui::DragValue::new(value)
+        .range(12.0..=108.0)
+        .speed(0.05)
+        .custom_formatter(|n, _| ai::note_name(n.round() as i32))
+        .custom_parser(|text| ai::parse_note(text).map(f64::from))
 }
 
 const SELECTION_TAB_WIDTH: f32 = 20.0;
@@ -65,7 +78,8 @@ fn stem_peaks(set: &StemSet, range: &Range<usize>, channels: usize, frames: usiz
         .collect()
 }
 
-type StemJob = mpsc::Receiver<Result<(StemSet, Range<usize>), String>>;
+type StemJob = mpsc::Receiver<Result<(StemSet, Range<usize>, [Option<Pitch>; 4]), String>>;
+type PitchJob = mpsc::Receiver<Result<Vec<(usize, Vec<i16>, Option<Pitch>)>, String>>;
 
 pub struct EditorView {
     pub sample: SampleEditor,
@@ -87,6 +101,9 @@ pub struct EditorView {
     target_bpm: f64,
     stems: Option<StemState>,
     stem_job: Option<StemJob>,
+    pitch_job: Option<PitchJob>,
+    pitch_semitones: f64,
+    pitch_from: Option<f64>,
     message: String,
 }
 
@@ -127,6 +144,9 @@ impl EditorView {
             target_bpm: 120.0,
             stems: None,
             stem_job: None,
+            pitch_job: None,
+            pitch_semitones: 0.0,
+            pitch_from: None,
             message: String::new(),
         };
         editor.rebuild_peaks();
@@ -310,7 +330,10 @@ impl EditorView {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let result = ai::separate(&audio, channels, rate)
-                .map(|set| (set, range))
+                .map(|set| {
+                    let pitches = [0, 1, 2, 3].map(|i| ai::detect_pitch(&set.stems[i], channels, rate));
+                    (set, range, pitches)
+                })
                 .map_err(|e| e.to_string());
             let _ = tx.send(result);
         });
@@ -324,8 +347,10 @@ impl EditorView {
     fn poll_stem_job(&mut self, ctx: &egui::Context) {
         let Some(rx) = &self.stem_job else { return };
         match rx.try_recv() {
-            Ok(Ok((set, range))) => {
+            Ok(Ok((set, range, pitch))) => {
                 self.stem_job = None;
+                self.pitch_semitones = 0.0;
+                self.pitch_from = None;
                 let peaks = stem_peaks(
                     &set,
                     &range,
@@ -338,6 +363,8 @@ impl EditorView {
                     include: [true; 4],
                     removed: [false; 4],
                     peaks,
+                    pitch,
+                    history: Vec::new(),
                 });
                 self.message =
                     "Stems ready: click a track's box to mute it, then preview, keep or copy them.".into();
@@ -354,6 +381,104 @@ impl EditorView {
                 self.message = "Stem separation failed: worker stopped".into();
             }
         }
+    }
+
+    /// The unmuted track with the clearest pitch: the reference for "From".
+    fn pitch_reference(&self) -> Option<(usize, Pitch)> {
+        let state = self.stems.as_ref()?;
+        state
+            .live()
+            .into_iter()
+            .filter(|i| state.include[*i])
+            .filter_map(|i| state.pitch[i].map(|p| (i, p)))
+            .max_by(|a, b| a.1.confidence.total_cmp(&b.1.confidence))
+    }
+
+    fn start_pitch_shift(&mut self) {
+        if self.pitch_job.is_some() {
+            return;
+        }
+        let Some(state) = &self.stems else { return };
+        let semitones = self.pitch_semitones;
+        if semitones.abs() < 0.005 {
+            self.message = "Pick a different target note first".into();
+            return;
+        }
+        let jobs: Vec<(usize, Vec<i16>)> = state
+            .live()
+            .into_iter()
+            .filter(|i| state.include[*i])
+            .map(|i| (i, state.set.stems[i].clone()))
+            .collect();
+        if jobs.is_empty() {
+            self.message = "Tick at least one track to change its pitch".into();
+            return;
+        }
+        let (channels, rate) = (self.sample.channels, self.sample.sample_rate);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = jobs
+                .into_iter()
+                .map(|(stem, audio)| {
+                    let shifted = ai::pitch_shift(&audio, channels, rate, semitones)?;
+                    let pitch = ai::detect_pitch(&shifted, channels, rate);
+                    Ok((stem, shifted, pitch))
+                })
+                .collect::<std::io::Result<Vec<_>>>()
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+        self.pitch_job = Some(rx);
+        self.message = format!("Shifting the ticked tracks by {semitones:+.2} semitones...");
+    }
+
+    fn poll_pitch_job(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.pitch_job else { return };
+        match rx.try_recv() {
+            Ok(Ok(results)) => {
+                self.pitch_job = None;
+                let (channels, frames) = (usize::from(self.sample.channels), self.sample.frames());
+                let Some(state) = self.stems.as_mut() else { return };
+                state.history.push((state.set.stems.clone(), state.pitch));
+                if state.history.len() > 8 {
+                    state.history.remove(0);
+                }
+                for (stem, audio, pitch) in results {
+                    state.set.stems[stem] = audio;
+                    state.pitch[stem] = pitch;
+                }
+                let peaks = stem_peaks(&state.set, &state.range, channels, frames);
+                state.peaks = peaks;
+                self.pitch_semitones = 0.0;
+                self.pitch_from = None;
+                self.message = "Pitch changed; tempo and length are unchanged. Undo pitch restores the previous audio.".into();
+                self.refresh_preview_source();
+            }
+            Ok(Err(e)) => {
+                self.pitch_job = None;
+                self.message = format!("Pitch change failed: {e}");
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(250))
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.pitch_job = None;
+                self.message = "Pitch change failed: worker stopped".into();
+            }
+        }
+    }
+
+    fn undo_pitch(&mut self) {
+        let (channels, frames) = (usize::from(self.sample.channels), self.sample.frames());
+        let Some(state) = self.stems.as_mut() else { return };
+        let Some((stems, pitch)) = state.history.pop() else { return };
+        state.set.stems = stems;
+        state.pitch = pitch;
+        let peaks = stem_peaks(&state.set, &state.range, channels, frames);
+        state.peaks = peaks;
+        self.pitch_from = None;
+        self.message = "Restored the audio from before the last pitch change.".into();
+        self.refresh_preview_source();
     }
 
     fn delete_stem(&mut self, stem: usize) {
@@ -398,6 +523,91 @@ impl EditorView {
                 }
             }
             None => self.selection.clone(),
+        }
+    }
+
+    /// The selection, when it covers only part of the sample.
+    fn partial_selection(&self) -> Option<Range<usize>> {
+        let frames = self.sample.frames();
+        (self.selection.start < self.selection.end
+            && self.selection.end <= frames
+            && self.selection != (0..frames))
+            .then(|| self.selection.clone())
+    }
+
+    /// Unsaved work that Close would throw away, including unmerged stem edits.
+    pub fn has_unsaved_changes(&self) -> bool {
+        self.sample.can_undo()
+            || self.stems.as_ref().is_some_and(|state| {
+                !state.history.is_empty()
+                    || state.removed.iter().any(|r| *r)
+                    || state.include.iter().zip(state.removed).any(|(on, gone)| !on && !gone)
+            })
+    }
+
+    /// Render the sample as Preview plays it: merge the unmuted stems into the sample, then
+    /// trim to `trim` when the user chose to keep only the selection.
+    fn finish_save_preparation(&mut self, trim: Option<Range<usize>>) -> Result<(), String> {
+        if self.stems.is_some() {
+            let (mix, range) = self.stem_mix()?;
+            self.sample
+                .replace_audio(range, &mix)
+                .map_err(|e| e.to_string())?;
+            self.stems = None;
+        }
+        if let Some(range) = trim {
+            self.sample.trim(range).map_err(|e| e.to_string())?;
+            self.selection = self.sample.play_range();
+            self.view_start = 0;
+            self.snap = false;
+        }
+        self.rebuild_peaks();
+        Ok(())
+    }
+
+    /// Everything Save to pad needs before the card is written. Returns false to abort.
+    fn prepare_save(&mut self) -> bool {
+        if self.stem_job.is_some() || self.pitch_job.is_some() {
+            self.message = "Wait for the stem or pitch job to finish before saving".into();
+            return false;
+        }
+        // Fail early, before asking anything, if the stems cannot be rendered.
+        if self.stems.is_some() {
+            if let Err(e) = self.stem_mix() {
+                self.message = e;
+                return false;
+            }
+        }
+        let _ = self.stop();
+        let trim = match self.partial_selection() {
+            Some(range) => {
+                let selected = self.seconds(range.end - range.start);
+                let total = self.seconds(self.sample.frames());
+                let answer = rfd::MessageDialog::new()
+                    .set_title("Keep only the selection?")
+                    .set_description(format!(
+                        "Only part of the sample is selected ({selected:.2} s of {total:.2} s).\n\n\
+                         Yes: trim the sample to the selection, then save.\n\
+                         No: save the whole sample.\n\
+                         Cancel: do not save."
+                    ))
+                    .set_buttons(rfd::MessageButtons::YesNoCancel)
+                    .set_level(rfd::MessageLevel::Info)
+                    .show();
+                match answer {
+                    rfd::MessageDialogResult::Yes => Some(range),
+                    rfd::MessageDialogResult::No => None,
+                    _ => return false,
+                }
+            }
+            None => None,
+        };
+        match self.finish_save_preparation(trim) {
+            Ok(()) => true,
+            Err(e) => {
+                self.message = e;
+                false
+            }
         }
     }
 
@@ -793,7 +1003,7 @@ impl EditorView {
                 let top = wave_rect.top() + lane * channel as f32;
                 let header = Rect::from_min_size(
                     Pos2::new(rect.left() + 22.0, top + 4.0),
-                    Vec2::new(96.0, 18.0),
+                    Vec2::new(124.0, 18.0),
                 );
                 let cross = Rect::from_min_size(
                     Pos2::new(header.right() + 3.0, header.top()),
@@ -823,6 +1033,15 @@ impl EditorView {
                     egui::FontId::proportional(11.0),
                     if on { Color32::from_gray(225) } else { Color32::from_gray(130) },
                 );
+                if let Some(pitch) = state.pitch[stem] {
+                    painter.text(
+                        Pos2::new(header.right() - 6.0, header.center().y),
+                        egui::Align2::RIGHT_CENTER,
+                        ai::note_name(pitch.nearest_note()),
+                        egui::FontId::proportional(11.0),
+                        if on { STEM_COLORS[stem] } else { Color32::from_gray(110) },
+                    );
+                }
                 painter.rect_filled(cross, 3.0, Color32::from_black_alpha(if remove.hovered() { 190 } else { 150 }));
                 painter.text(
                     cross.center(),
@@ -1208,6 +1427,7 @@ impl EditorView {
     pub fn show(&mut self, ctx: &egui::Context, class: egui::ViewportClass) -> Action {
         self.poll_ai_job(ctx);
         self.poll_stem_job(ctx);
+        self.poll_pitch_job(ctx);
         self.sync_live_preview();
         if self.is_playing() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
@@ -1428,6 +1648,8 @@ impl EditorView {
 
                     let mut discard_stems = false;
                     let mut stems_changed = false;
+                    let mut apply_pitch = false;
+                    let mut undo_pitch = false;
                     ui.collapsing("Stems (AI separation)", |ui| {
                         let range = self.stem_range();
                         ui.horizontal_wrapped(|ui| {
@@ -1491,7 +1713,82 @@ impl EditorView {
                                 }
                             });
                         }
+                        if self.stems.is_some() {
+                            ui.separator();
+                            ui.label("Pitch of the ticked tracks (tempo unchanged)");
+                            let reference = self.pitch_reference();
+                            let from = self
+                                .pitch_from
+                                .or(reference.map(|(_, p)| p.midi))
+                                .unwrap_or(48.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("From");
+                                let mut from_note = from.round();
+                                if ui.add(note_drag(&mut from_note)).changed() {
+                                    // Keep the target note fixed while the source note is corrected.
+                                    let target = (from + self.pitch_semitones).round();
+                                    self.pitch_from = Some(from_note);
+                                    self.pitch_semitones = target - from_note;
+                                }
+                                match (self.pitch_from, reference) {
+                                    (Some(_), _) => {
+                                        if ui.small_button("Auto").on_hover_text("Use the detected note").clicked() {
+                                            self.pitch_from = None;
+                                        }
+                                    }
+                                    (None, Some((stem, pitch))) => {
+                                        ui.weak(format!(
+                                            "detected on {} ({:+} cents)",
+                                            STEM_NAMES[stem],
+                                            pitch.cents()
+                                        ));
+                                    }
+                                    (None, None) => {
+                                        ui.weak("no clear pitch detected: set the note by hand");
+                                    }
+                                }
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("To");
+                                let mut to_note = (from + self.pitch_semitones).round();
+                                if ui.add(note_drag(&mut to_note)).changed() {
+                                    self.pitch_semitones = to_note - from;
+                                }
+                                ui.label("Semitones");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.pitch_semitones)
+                                        .range(-36.0..=36.0)
+                                        .speed(0.05)
+                                        .fixed_decimals(2)
+                                        .suffix(" st"),
+                                );
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                let busy = self.pitch_job.is_some();
+                                if ui
+                                    .add(Self::button("Apply pitch", !busy && self.pitch_semitones.abs() >= 0.005))
+                                    .on_hover_text("Shift every ticked track; muted tracks are left alone")
+                                    .clicked()
+                                {
+                                    apply_pitch = true;
+                                }
+                                let can_undo = self.stems.as_ref().is_some_and(|s| !s.history.is_empty());
+                                if ui.add(Self::button("Undo pitch", can_undo && !busy)).clicked() {
+                                    undo_pitch = true;
+                                }
+                                if ui.add(Self::button("Reset", true)).clicked() {
+                                    self.pitch_semitones = 0.0;
+                                    self.pitch_from = None;
+                                }
+                            });
+                        }
                     });
+                    if apply_pitch {
+                        self.start_pitch_shift();
+                    }
+                    if undo_pitch {
+                        self.undo_pitch();
+                    }
 
                     if stems_changed {
                         self.refresh_preview_source();
@@ -1517,9 +1814,12 @@ impl EditorView {
                     }
                     ui.horizontal(|ui| {
                         if ui
-                            .add(Self::primary("Save to pad", self.sample.can_undo()))
-                            .on_hover_text("Write the edited sample and pad settings to the card")
+                            .add(Self::primary("Save to pad", true))
+                            .on_hover_text(
+                                "Write the sample as Preview plays it (ticked stems merged) and the pad settings to the card",
+                            )
                             .clicked()
+                            && self.prepare_save()
                         {
                             action = Action::Save;
                         }
@@ -1765,12 +2065,120 @@ mod tests {
             range: 200..800,
             include: [true; 4],
             removed: [false; 4],
+            pitch: [None; 4],
+            history: Vec::new(),
         });
         editor.selection = 300..400;
         assert_eq!(editor.preview_target(), 300..400);
         editor.selection = 0..0;
         assert_eq!(editor.preview_target(), 200..800);
         assert_eq!(editor.whole_range(), 200..800);
+    }
+
+    fn stem_editor(include: [bool; 4]) -> EditorView {
+        let mut editor = test_editor();
+        let set = StemSet {
+            stems: [vec![1; 600], vec![10; 600], vec![100; 600], vec![1000; 600]],
+        };
+        editor.stems = Some(StemState {
+            peaks: stem_peaks(&set, &(200..800), 1, 1000),
+            set,
+            range: 200..800,
+            include,
+            removed: [false; 4],
+            pitch: [None; 4],
+            history: Vec::new(),
+        });
+        editor
+    }
+
+    #[test]
+    fn saving_renders_the_unmuted_stems_into_the_sample() {
+        let mut editor = stem_editor([false, true, true, false]);
+        assert!(!editor.sample.can_undo());
+        editor.finish_save_preparation(None).unwrap();
+        assert!(editor.stems.is_none());
+        assert!(editor.sample.audio_changed());
+        assert!(editor.sample.can_undo(), "the render is an undoable edit");
+        let audio = editor.sample.samples();
+        assert_eq!(audio.len(), 1000);
+        assert_eq!(audio[100], 0, "outside the separated region is untouched");
+        assert!(audio[200..800].iter().all(|s| *s == 110), "only the unmuted stems are rendered");
+        assert_eq!(audio[900], 0);
+    }
+
+    #[test]
+    fn saving_with_every_track_muted_fails_without_touching_the_sample() {
+        let mut editor = stem_editor([false; 4]);
+        assert!(editor.finish_save_preparation(None).is_err());
+        assert!(editor.stems.is_some());
+        assert!(!editor.sample.can_undo());
+    }
+
+    #[test]
+    fn keeping_the_selection_trims_after_rendering_the_stems() {
+        let mut editor = stem_editor([true, false, false, false]);
+        editor.selection = 300..500;
+        assert_eq!(editor.partial_selection(), Some(300..500));
+        editor.finish_save_preparation(Some(300..500)).unwrap();
+        assert_eq!(editor.sample.frames(), 200);
+        assert!(editor.sample.samples().iter().all(|s| *s == 1));
+        assert_eq!(editor.sample.play_range(), 0..200);
+        assert_eq!(editor.selection, 0..200);
+    }
+
+    #[test]
+    fn only_a_partial_selection_triggers_the_trim_question() {
+        let mut editor = test_editor();
+        editor.selection = 0..1000;
+        assert_eq!(editor.partial_selection(), None, "the whole sample needs no question");
+        editor.selection = 400..400;
+        assert_eq!(editor.partial_selection(), None, "no selection needs no question");
+        editor.selection = 0..999;
+        assert_eq!(editor.partial_selection(), Some(0..999));
+        editor.selection = 500..2000;
+        assert_eq!(editor.partial_selection(), None, "an out-of-range selection is ignored");
+    }
+
+    #[test]
+    fn unmerged_stem_edits_count_as_unsaved_changes() {
+        let mut editor = stem_editor([true; 4]);
+        assert!(!editor.has_unsaved_changes(), "plain separation alone loses nothing");
+        editor.stems.as_mut().unwrap().include[1] = false;
+        assert!(editor.has_unsaved_changes(), "muting a track is unmerged work");
+        let mut editor = stem_editor([true; 4]);
+        editor.delete_stem(2);
+        assert!(editor.has_unsaved_changes());
+        let mut editor = test_editor();
+        assert!(!editor.has_unsaved_changes());
+        editor.sample.normalize().ok();
+        editor.sample.replace_audio(0..2, &[5, 5]).unwrap();
+        assert!(editor.has_unsaved_changes());
+    }
+
+    #[test]
+    fn pitch_reference_is_the_clearest_unmuted_track() {
+        let mut editor = test_editor();
+        let set = StemSet {
+            stems: [vec![0; 1000], vec![0; 1000], vec![0; 1000], vec![0; 1000]],
+        };
+        let pitch = |midi, confidence| Some(Pitch { midi, confidence });
+        editor.stems = Some(StemState {
+            peaks: stem_peaks(&set, &(0..1000), 1, 1000),
+            set,
+            range: 0..1000,
+            include: [true; 4],
+            removed: [false; 4],
+            pitch: [pitch(60.0, 0.5), None, pitch(38.2, 0.9), pitch(45.0, 0.7)],
+            history: Vec::new(),
+        });
+        assert_eq!(editor.pitch_reference().map(|r| r.0), Some(2));
+        editor.stems.as_mut().unwrap().include[2] = false;
+        assert_eq!(editor.pitch_reference().map(|r| r.0), Some(3), "muted tracks are ignored");
+        editor.delete_stem(3);
+        assert_eq!(editor.pitch_reference().map(|r| r.0), Some(0));
+        editor.stems.as_mut().unwrap().include[0] = false;
+        assert!(editor.pitch_reference().is_none());
     }
 
     #[test]
@@ -1785,6 +2193,8 @@ mod tests {
             range: 0..1000,
             include: [true; 4],
             removed: [false; 4],
+            pitch: [None; 4],
+            history: Vec::new(),
         });
         editor.selection = 0..10;
         editor.delete_stem(3);
@@ -1810,6 +2220,8 @@ mod tests {
             range: 0..1000,
             include: [true, false, true, false],
             removed: [false; 4],
+            pitch: [None; 4],
+            history: Vec::new(),
         });
         editor.selection = 100..200;
         assert_eq!(editor.preview_target(), 100..200);
