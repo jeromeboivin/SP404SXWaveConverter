@@ -1,4 +1,5 @@
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
+use sp404sx_wave_converter::ai::{self, StemSet, STEM_NAMES};
 use sp404sx_wave_converter::editor::{BeatGrid, SampleEditor};
 use sp404sx_wave_converter::Pad;
 use std::ops::Range;
@@ -11,7 +12,17 @@ pub enum Action {
     None,
     Save,
     Close,
+    /// Separated audio to import into free pads: (label, WAV file).
+    CopyStems(Vec<(String, tempfile::NamedTempFile)>),
 }
+
+struct StemState {
+    set: StemSet,
+    range: Range<usize>,
+    include: [bool; 4],
+}
+
+type StemJob = mpsc::Receiver<Result<(StemSet, Range<usize>), String>>;
 
 pub struct EditorView {
     pub sample: SampleEditor,
@@ -33,6 +44,8 @@ pub struct EditorView {
     playhead: Option<(Instant, usize, usize, bool)>,
     ai_job: Option<mpsc::Receiver<Result<BeatGrid, String>>>,
     target_bpm: f64,
+    stems: Option<StemState>,
+    stem_job: Option<StemJob>,
     message: String,
 }
 
@@ -73,6 +86,8 @@ impl EditorView {
             playhead: None,
             ai_job: None,
             target_bpm: 120.0,
+            stems: None,
+            stem_job: None,
             message: String::new(),
         };
         editor.rebuild_peaks();
@@ -139,6 +154,10 @@ impl EditorView {
         self.sample
             .write_wav_range(file.path(), self.selection.clone())
             .map_err(|e| format!("Could not write preview: {e}"))?;
+        self.play_file(file, self.selection.clone())
+    }
+
+    fn play_file(&mut self, file: tempfile::NamedTempFile, range: Range<usize>) -> Result<(), String> {
         let mut command = Command::new("ffplay");
         command.args(["-nodisp", "-autoexit", "-loglevel", "error"]);
         if self.loop_preview {
@@ -151,18 +170,14 @@ impl EditorView {
             .map_err(|e| format!("Could not start ffplay: {e}"))?;
         self.preview = Some(file);
         self.player = Some(child);
-        self.playhead = Some((
-            Instant::now(),
-            self.selection.start,
-            self.selection.end,
-            self.loop_preview,
-        ));
+        self.playhead = Some((Instant::now(), range.start, range.end, self.loop_preview));
         Ok(())
     }
 
     fn after_edit(&mut self, result: std::io::Result<()>) {
         match result {
             Ok(()) => {
+                self.stems = None;
                 self.selection = self.sample.play_range();
                 self.view_start = 0;
                 self.snap = false;
@@ -187,6 +202,7 @@ impl EditorView {
 
     fn do_undo(&mut self) {
         if self.sample.undo() {
+            self.stems = None;
             self.selection = self.sample.play_range();
             self.pending_play = None;
             self.snap = false;
@@ -197,12 +213,153 @@ impl EditorView {
 
     fn do_redo(&mut self) {
         if self.sample.redo() {
+            self.stems = None;
             self.selection = self.sample.play_range();
             self.pending_play = None;
             self.snap = false;
             self.rebuild_peaks();
             self.message = "Redone; check the beat grid before snapping again.".into();
         }
+    }
+
+    fn stem_range(&self) -> Range<usize> {
+        if self.selection.start < self.selection.end && self.selection.end <= self.sample.frames() {
+            self.selection.clone()
+        } else {
+            0..self.sample.frames()
+        }
+    }
+
+    fn start_separation(&mut self) {
+        if self.stem_job.is_some() {
+            return;
+        }
+        let range = self.stem_range();
+        let audio = match self.sample.samples_in(range.clone()) {
+            Ok(audio) => audio.to_vec(),
+            Err(e) => {
+                self.message = e.to_string();
+                return;
+            }
+        };
+        let (channels, rate) = (self.sample.channels, self.sample.sample_rate);
+        let seconds = self.seconds(range.end - range.start);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = ai::separate(&audio, channels, rate)
+                .map(|set| (set, range))
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+        self.stem_job = Some(rx);
+        self.stems = None;
+        self.message = format!(
+            "Separating {seconds:.1} s into stems (CPU, roughly the same time again; first use downloads a ~210 MB model)..."
+        );
+    }
+
+    fn poll_stem_job(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.stem_job else { return };
+        match rx.try_recv() {
+            Ok(Ok((set, range))) => {
+                self.stem_job = None;
+                self.stems = Some(StemState {
+                    set,
+                    range,
+                    include: [true; 4],
+                });
+                self.message =
+                    "Stems ready: tick the ones to keep, then preview, apply or copy them.".into();
+            }
+            Ok(Err(e)) => {
+                self.stem_job = None;
+                self.message = format!("Stem separation failed: {e}");
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(250))
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.stem_job = None;
+                self.message = "Stem separation failed: worker stopped".into();
+            }
+        }
+    }
+
+    fn stem_mix(&self) -> Result<(Vec<i16>, Range<usize>), String> {
+        let state = self.stems.as_ref().ok_or("Separate stems first")?;
+        let mix = state
+            .set
+            .mix(state.include)
+            .ok_or("Tick at least one stem")?;
+        Ok((mix, state.range.clone()))
+    }
+
+    fn preview_stem_mix(&mut self) {
+        let result = (|| -> Result<(), String> {
+            let (mix, range) = self.stem_mix()?;
+            self.stop()?;
+            let file = tempfile::Builder::new()
+                .suffix(".wav")
+                .tempfile()
+                .map_err(|e| format!("Could not create preview: {e}"))?;
+            ai::write_wav(file.path(), &mix, self.sample.channels, self.sample.sample_rate)
+                .map_err(|e| format!("Could not write preview: {e}"))?;
+            self.play_file(file, range)
+        })();
+        if let Err(e) = result {
+            self.message = e;
+        }
+    }
+
+    fn apply_stem_mix(&mut self) {
+        let (mix, range) = match self.stem_mix() {
+            Ok(v) => v,
+            Err(e) => {
+                self.message = e;
+                return;
+            }
+        };
+        if let Err(e) = self.stop() {
+            self.message = e;
+            return;
+        }
+        let result = self.sample.replace_audio(range, &mix);
+        let ok = result.is_ok();
+        self.after_edit(result);
+        if ok {
+            self.message =
+                "Replaced the region with the ticked stems; Undo restores the original.".into();
+        }
+    }
+
+    /// Build WAV files for the ticked stems, one per stem or a single mix.
+    fn export_stems(&self, separate: bool) -> Result<Vec<(String, tempfile::NamedTempFile)>, String> {
+        let state = self.stems.as_ref().ok_or("Separate stems first")?;
+        let mut parts: Vec<(String, Vec<i16>)> = Vec::new();
+        if separate {
+            for (i, name) in STEM_NAMES.iter().enumerate() {
+                if state.include[i] {
+                    parts.push((name.to_string(), state.set.stems[i].clone()));
+                }
+            }
+        } else if let Some(mix) = state.set.mix(state.include) {
+            parts.push(("mix".into(), mix));
+        }
+        if parts.is_empty() {
+            return Err("Tick at least one stem".into());
+        }
+        parts
+            .into_iter()
+            .map(|(name, audio)| {
+                let file = tempfile::Builder::new()
+                    .suffix(".wav")
+                    .tempfile()
+                    .map_err(|e| format!("Could not create stem file: {e}"))?;
+                ai::write_wav(file.path(), &audio, self.sample.channels, self.sample.sample_rate)
+                    .map_err(|e| format!("Could not write stem file: {e}"))?;
+                Ok((name, file))
+            })
+            .collect()
     }
 
     fn start_ai_detect(&mut self) {
@@ -808,6 +965,7 @@ impl EditorView {
 
     pub fn show(&mut self, ctx: &egui::Context, class: egui::ViewportClass) -> Action {
         self.poll_ai_job(ctx);
+        self.poll_stem_job(ctx);
         if let Some(child) = self.player.as_mut() {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -1034,6 +1192,66 @@ impl EditorView {
                                 self.stretch_to_target();
                             }
                         });
+                    });
+
+                    ui.collapsing("Stems (AI separation)", |ui| {
+                        let range = self.stem_range();
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .add(Self::button("Separate", self.stem_job.is_none()))
+                                .on_hover_text(
+                                    "Split the selection (or the whole sample) into vocals, drums, bass and other with htdemucs",
+                                )
+                                .clicked()
+                            {
+                                self.start_separation();
+                            }
+                            ui.label(format!(
+                                "{:.1} s region",
+                                self.seconds(range.end - range.start)
+                            ));
+                        });
+                        if let Some(state) = self.stems.as_mut() {
+                            ui.horizontal_wrapped(|ui| {
+                                for (i, name) in STEM_NAMES.iter().enumerate() {
+                                    ui.checkbox(&mut state.include[i], *name);
+                                }
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.add(Self::button("Preview mix", true)).clicked() {
+                                    self.preview_stem_mix();
+                                }
+                                if ui
+                                    .add(Self::button("Keep ticked in sample", true))
+                                    .on_hover_text("Replace the separated region with the sum of the ticked stems")
+                                    .clicked()
+                                {
+                                    self.apply_stem_mix();
+                                }
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                if ui
+                                    .add(Self::button("Mix to free pad", true))
+                                    .on_hover_text("Copy the ticked stems, summed, to the next free pad")
+                                    .clicked()
+                                {
+                                    match self.export_stems(false) {
+                                        Ok(files) => action = Action::CopyStems(files),
+                                        Err(e) => self.message = e,
+                                    }
+                                }
+                                if ui
+                                    .add(Self::button("Each stem to free pads", true))
+                                    .on_hover_text("Copy each ticked stem to its own free pad")
+                                    .clicked()
+                                {
+                                    match self.export_stems(true) {
+                                        Ok(files) => action = Action::CopyStems(files),
+                                        Err(e) => self.message = e,
+                                    }
+                                }
+                            });
+                        }
                     });
 
                     ui.separator();

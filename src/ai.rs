@@ -161,3 +161,209 @@ pub fn stretch(
     stretcher.exact(input, &mut output);
     Ok(output)
 }
+
+/// Stem names in the order used by [`StemSet::stems`].
+pub const STEM_NAMES: [&str; 4] = ["vocals", "drums", "bass", "other"];
+
+/// Separated audio, interleaved i16 at the source's channel count and sample rate,
+/// each stem exactly as long as the input.
+#[derive(Clone)]
+pub struct StemSet {
+    pub stems: [Vec<i16>; 4],
+}
+
+impl StemSet {
+    /// Sum the stems whose flag is set (clamped); `None` if nothing is selected.
+    pub fn mix(&self, include: [bool; 4]) -> Option<Vec<i16>> {
+        if !include.iter().any(|on| *on) {
+            return None;
+        }
+        let len = self.stems[0].len();
+        let mut out = vec![0i32; len];
+        for (stem, on) in self.stems.iter().zip(include) {
+            if on {
+                for (acc, s) in out.iter_mut().zip(stem) {
+                    *acc += i32::from(*s);
+                }
+            }
+        }
+        Some(
+            out.into_iter()
+                .map(|v| v.clamp(-32768, 32767) as i16)
+                .collect(),
+        )
+    }
+}
+
+/// Write 16-bit PCM interleaved samples as a WAV file.
+pub fn write_wav(path: &Path, samples: &[i16], channels: u16, sample_rate: u32) -> io::Result<()> {
+    let len = u32::try_from(samples.len() * 2).map_err(|_| invalid("audio is too long"))?;
+    let block = u32::from(channels) * 2;
+    let mut out = io::BufWriter::new(fs::File::create(path)?);
+    out.write_all(b"RIFF")?;
+    out.write_all(&(36 + len).to_le_bytes())?;
+    out.write_all(b"WAVEfmt ")?;
+    out.write_all(&16u32.to_le_bytes())?;
+    out.write_all(&1u16.to_le_bytes())?;
+    out.write_all(&channels.to_le_bytes())?;
+    out.write_all(&sample_rate.to_le_bytes())?;
+    out.write_all(&(sample_rate * block).to_le_bytes())?;
+    out.write_all(&(block as u16).to_le_bytes())?;
+    out.write_all(&16u16.to_le_bytes())?;
+    out.write_all(b"data")?;
+    out.write_all(&len.to_le_bytes())?;
+    for s in samples {
+        out.write_all(&s.to_le_bytes())?;
+    }
+    out.flush()
+}
+
+/// Minimal reader for 16-bit PCM WAV files: (interleaved samples, channels, rate).
+fn read_wav(path: &Path) -> io::Result<(Vec<i16>, u16, u32)> {
+    let bytes = fs::read(path)?;
+    if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err(invalid("stem output is not a WAV file"));
+    }
+    let (mut channels, mut rate, mut bits) = (0u16, 0u32, 0u16);
+    let mut pos = 12;
+    while pos + 8 <= bytes.len() {
+        let id = &bytes[pos..pos + 4];
+        let size = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        let body = pos + 8;
+        let end = (body + size).min(bytes.len());
+        if id == b"fmt " && end - body >= 16 {
+            channels = u16::from_le_bytes([bytes[body + 2], bytes[body + 3]]);
+            rate = u32::from_le_bytes(bytes[body + 4..body + 8].try_into().unwrap());
+            bits = u16::from_le_bytes([bytes[body + 14], bytes[body + 15]]);
+        } else if id == b"data" {
+            if bits != 16 || channels == 0 {
+                return Err(invalid("stem output is not 16-bit PCM"));
+            }
+            let samples = bytes[body..end]
+                .chunks_exact(2)
+                .map(|b| i16::from_le_bytes([b[0], b[1]]))
+                .collect();
+            return Ok((samples, channels, rate));
+        }
+        pos = body + size + size % 2;
+    }
+    Err(invalid("stem output has no audio data"))
+}
+
+/// Convert interleaved audio to another channel count (1 or 2) and sample rate,
+/// with a box filter when downsampling, and force an exact output length.
+fn convert(
+    samples: &[i16],
+    from_channels: u16,
+    from_rate: u32,
+    to_channels: u16,
+    to_rate: u32,
+    out_frames: usize,
+) -> Vec<i16> {
+    let fc = usize::from(from_channels);
+    let tc = usize::from(to_channels);
+    let frames = samples.len() / fc;
+    let channel = |frame: usize, c: usize| -> f32 {
+        if frame >= frames {
+            return 0.0;
+        }
+        if tc == 1 {
+            (0..fc).map(|k| f32::from(samples[frame * fc + k])).sum::<f32>() / fc as f32
+        } else {
+            f32::from(samples[frame * fc + c.min(fc - 1)])
+        }
+    };
+    let ratio = f64::from(from_rate) / f64::from(to_rate);
+    let mut out = Vec::with_capacity(out_frames * tc);
+    for j in 0..out_frames {
+        let start = j as f64 * ratio;
+        for c in 0..tc {
+            let value = if (ratio - 1.0).abs() < 1e-9 {
+                channel(j, c)
+            } else if ratio > 1.0 {
+                let (a, b) = (start.floor() as usize, ((start + ratio).ceil() as usize).max(1));
+                let n = (a..b).count().max(1);
+                (a..b).map(|f| channel(f, c)).sum::<f32>() / n as f32
+            } else {
+                let a = start.floor() as usize;
+                let t = (start - a as f64) as f32;
+                channel(a, c) * (1.0 - t) + channel(a + 1, c) * t
+            };
+            out.push(value.round().clamp(-32768.0, 32767.0) as i16);
+        }
+    }
+    out
+}
+
+/// Separate audio into vocals, drums, bass and other with htdemucs (stem-splitter-core).
+/// The model (~210 MB) is downloaded by the crate on first use. This is slow on CPU.
+pub fn separate(samples: &[i16], channels: u16, sample_rate: u32) -> io::Result<StemSet> {
+    let frames = samples.len() / usize::from(channels.max(1));
+    if frames == 0 {
+        return Err(invalid("nothing to separate"));
+    }
+    let work = tempfile::tempdir()?;
+    let input = work.path().join("input.wav");
+    // The model needs 44.1 kHz stereo and the crate does not resample for us.
+    let model_frames = (frames as f64 * 44100.0 / f64::from(sample_rate)).round() as usize;
+    let model_input = convert(samples, channels, sample_rate, 2, 44100, model_frames);
+    write_wav(&input, &model_input, 2, 44100)?;
+    let result = stem_splitter_core::split_file(
+        input.to_str().ok_or_else(|| invalid("temporary path is not UTF-8"))?,
+        stem_splitter_core::SplitOptions {
+            output_dir: work
+                .path()
+                .to_str()
+                .ok_or_else(|| invalid("temporary path is not UTF-8"))?
+                .to_owned(),
+            ..Default::default()
+        },
+    )
+    .map_err(|e| io::Error::other(format!("stem separation failed: {e}")))?;
+    let paths = [
+        result.vocals_path,
+        result.drums_path,
+        result.bass_path,
+        result.other_path,
+    ];
+    let mut stems: [Vec<i16>; 4] = Default::default();
+    for (slot, path) in stems.iter_mut().zip(paths) {
+        let (data, c, r) = read_wav(Path::new(&path))?;
+        *slot = convert(&data, c, r, channels, sample_rate, frames);
+    }
+    Ok(StemSet { stems })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mix_sums_ticked_stems_and_clamps() {
+        let set = StemSet {
+            stems: [vec![30000, -100], vec![30000, 50], vec![1, 1], vec![0, 0]],
+        };
+        assert_eq!(set.mix([true, true, false, false]).unwrap(), vec![32767, -50]);
+        assert_eq!(set.mix([false, false, true, false]).unwrap(), vec![1, 1]);
+        assert!(set.mix([false; 4]).is_none());
+    }
+
+    #[test]
+    fn convert_changes_rate_channels_and_forces_length() {
+        let stereo: Vec<i16> = (0..4410).flat_map(|i| [i as i16, i as i16]).collect();
+        let mono = convert(&stereo, 2, 44100, 1, 22050, 2205);
+        assert_eq!(mono.len(), 2205);
+        assert!((i32::from(mono[1000]) - 2000).abs() < 3);
+        let padded = convert(&stereo, 2, 44100, 2, 44100, 5000);
+        assert_eq!(padded.len(), 10000);
+        assert_eq!(padded[9999], 0);
+    }
+
+    #[test]
+    fn wav_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.wav");
+        write_wav(&path, &[1, -2, 3, -4], 2, 22050).unwrap();
+        assert_eq!(read_wav(&path).unwrap(), (vec![1, -2, 3, -4], 2, 22050));
+    }
+}

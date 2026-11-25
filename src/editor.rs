@@ -237,6 +237,26 @@ impl SampleEditor {
             .collect()
     }
 
+    /// Replace the audio in `range` with `audio` of the same length (undoable).
+    pub fn replace_audio(&mut self, range: Range<usize>, audio: &[i16]) -> io::Result<()> {
+        self.check_range(&range)?;
+        let channels = usize::from(self.channels);
+        if audio.len() != (range.end - range.start) * channels {
+            return Err(invalid("replacement audio has the wrong length"));
+        }
+        self.checkpoint();
+        Arc::make_mut(&mut self.state.samples)[range.start * channels..range.end * channels]
+            .copy_from_slice(audio);
+        Ok(())
+    }
+
+    /// Samples of `range` (interleaved).
+    pub fn samples_in(&self, range: Range<usize>) -> io::Result<&[i16]> {
+        self.check_range(&range)?;
+        let channels = usize::from(self.channels);
+        Ok(&self.state.samples[range.start * channels..range.end * channels])
+    }
+
     /// Time-stretch `range` by `ratio` (new length / old length) without changing pitch.
     /// Play range edges move with the audio.
     pub fn time_stretch(&mut self, range: Range<usize>, ratio: f64) -> io::Result<()> {
@@ -600,6 +620,17 @@ mod tests {
     fn crossings_per_second(samples: &[i16], rate: u32) -> f32 {
         let crossings = samples.windows(2).filter(|w| w[0] < 0 && w[1] >= 0).count();
         crossings as f32 * rate as f32 / samples.len() as f32
+    }
+
+    #[test]
+    fn replace_audio_keeps_length_and_is_undoable() {
+        let mut sample = editor(vec![1, 2, 3, 4, 5, 6], 2, 0..3);
+        sample.replace_audio(1..3, &[9, 9, 8, 8]).unwrap();
+        assert_eq!(sample.samples(), &[1, 2, 9, 9, 8, 8]);
+        assert!(sample.audio_changed());
+        assert!(sample.replace_audio(0..1, &[1]).is_err());
+        assert!(sample.undo());
+        assert_eq!(sample.samples(), &[1, 2, 3, 4, 5, 6]);
     }
 
     #[test]

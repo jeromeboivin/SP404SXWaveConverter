@@ -363,6 +363,51 @@ impl App {
         self.refresh_after_change();
     }
 
+    /// Import separated stems into the first free pads, starting at the editor's bank.
+    fn copy_stems_to_free_pads(
+        &mut self,
+        editor: &EditorView,
+        files: Vec<(String, tempfile::NamedTempFile)>,
+    ) -> String {
+        if !self.stop() {
+            return "Could not stop the preview first.".into();
+        }
+        let Some(card) = self.card.as_mut() else {
+            return "Card is not open.".into();
+        };
+        if card.root != editor.root {
+            return "Card changed since the editor was opened.".into();
+        }
+        let free = free_pads(card, editor.pad.bank, files.len());
+        if free.len() < files.len() {
+            return format!(
+                "Need {} free pads but only {} are free; nothing was copied.",
+                files.len(),
+                free.len()
+            );
+        }
+        let mut done = Vec::new();
+        for ((name, file), (bank, number)) in files.iter().zip(&free) {
+            if let Err(error) = card.import_sample(*bank, *number, file.path()) {
+                let message = format!(
+                    "Copy of {name} to {bank}{number} failed: {error}{}",
+                    if done.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (already copied: {})", done.join(", "))
+                    }
+                );
+                self.refresh_after_change();
+                return message;
+            }
+            done.push(format!("{name} -> {bank}{number}"));
+        }
+        self.refresh_after_change();
+        let message = format!("Copied to free pads: {}.", done.join(", "));
+        self.message = message.clone();
+        message
+    }
+
     fn delete(&mut self, number: u8) {
         if !Self::confirm(
             "Delete sample?",
@@ -914,6 +959,11 @@ impl eframe::App for App {
                         self.editor = Some(editor);
                     }
                 }
+                EditorAction::CopyStems(files) => {
+                    let message = self.copy_stems_to_free_pads(&editor, files);
+                    editor.set_message(message);
+                    self.editor = Some(editor);
+                }
                 EditorAction::Save => {
                     if !Self::confirm("Save pad?", "Save the edited sample and pad settings?") {
                         self.editor = Some(editor);
@@ -963,6 +1013,17 @@ impl eframe::App for App {
             }
         }
     }
+}
+
+/// The first `count` empty pads, scanning banks from `start_bank` and wrapping around.
+fn free_pads(card: &Card, start_bank: char, count: usize) -> Vec<(char, u8)> {
+    let first = (start_bank as u8).saturating_sub(b'A') as usize % 10;
+    (0..10)
+        .map(|i| (b'A' + ((first + i) % 10) as u8) as char)
+        .flat_map(|bank| (1..=12u8).map(move |number| (bank, number)))
+        .filter(|(bank, number)| card.pad(*bank, *number).is_some_and(|pad| pad.file.is_none()))
+        .take(count)
+        .collect()
 }
 
 #[cfg(test)]
@@ -1160,6 +1221,17 @@ mod tests {
 
         app.cancel_transfer();
         assert!(app.transfer.is_none());
+    }
+
+    #[test]
+    fn free_pads_skip_occupied_pads_and_wrap_banks() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = app_with_samples(temp.path(), &["B0000001.WAV", "B0000003.WAV", "A0000001.WAV"]);
+        let card = app.card.as_ref().unwrap();
+        assert_eq!(free_pads(card, 'B', 3), vec![('B', 2), ('B', 4), ('B', 5)]);
+        assert_eq!(free_pads(card, 'J', 2), vec![('J', 1), ('J', 2)]);
+        assert_eq!(free_pads(card, 'A', 1), vec![('A', 2)]);
+        assert_eq!(free_pads(card, 'A', 200).len(), 117);
     }
 
     #[test]
