@@ -18,13 +18,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-22.04
+          - os: ubuntu-24.04   # ort's prebuilt libs need glibc >= 2.38
             target: linux
           - os: windows-latest
             target: windows
           - os: macos-latest      # Apple Silicon
             target: macos-arm64
-          - os: macos-13          # Intel
+          - os: macos-15-intel    # Intel
             target: macos-x64
     runs-on: ${{ matrix.os }}
     steps:
@@ -45,6 +45,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libasound2-dev libclang-dev libxkbcommon-dev libwayland-dev libx11-dev libgl1-mesa-dev
           cargo install cargo-deb --locked
+
+      # ort's build script copies DirectML.dll into these and panics if missing.
+      - name: Windows prebuild dirs
+        if: matrix.target == 'windows'
+        shell: bash
+        run: mkdir -p target/release/examples target/release/deps
 
       - name: Build
         run: cargo build --release --locked
