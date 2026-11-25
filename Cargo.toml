@@ -23,3 +23,16 @@ ureq = "2"
 # Neural beat tracking (rten) is unusably slow unoptimized.
 [profile.dev.package."*"]
 opt-level = 3
+
+[package.metadata.deb]
+name = "sp404sx-wave-converter"
+maintainer = "Jerome Boivin <boivin.jerome@gmail.com>"
+section = "sound"
+priority = "optional"
+depends = "$auto"
+extended-description = "Converts audio files and manages samples for the Roland SP-404SX/A sampler cards."
+assets = [
+    ["target/release/sp404sx-wave-converter", "usr/bin/", "755"],
+    ["assets/icon-256.png", "usr/share/icons/hicolor/256x256/apps/sp404sx-wave-converter.png", "644"],
+    ["packaging/sp404sx-wave-converter.deb.desktop", "usr/share/applications/sp404sx-wave-converter.desktop", "644"],
+]

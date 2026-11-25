@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=SP-404SX Wave Converter
+Comment=Manage SP-404SX/A card samples
+Exec=sp404sx-wave-converter
+Icon=sp404sx-wave-converter
+Terminal=false
+Categories=AudioVideo;Audio;
+StartupWMClass=sp404sx-wave-converter
