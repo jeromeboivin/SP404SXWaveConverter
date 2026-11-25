@@ -22,10 +22,9 @@ jobs:
             target: linux
           - os: windows-latest
             target: windows
+          # No Intel mac: ort publishes no prebuilt ONNX Runtime for x86_64-apple-darwin.
           - os: macos-latest      # Apple Silicon
             target: macos-arm64
-          - os: macos-15-intel    # Intel
-            target: macos-x64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -50,7 +49,7 @@ jobs:
       - name: Windows prebuild dirs
         if: matrix.target == 'windows'
         shell: bash
-        run: mkdir -p target/release/examples target/release/deps
+        run: mkdir -p target/release/build/examples target/release/build/deps
 
       - name: Build
         run: cargo build --release --locked
